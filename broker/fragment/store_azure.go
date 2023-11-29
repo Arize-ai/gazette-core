@@ -285,6 +285,7 @@ func (a *azureBackend) azureClient(ep *url.URL) (cfg AzureStoreConfig, client pi
 		if err != nil {
 			return cfg, nil, err
 		}
+		a.sharedKeyCredentials = sharedKeyCred // Arize addition
 		serviceClient, err := service.NewClientWithSharedKeyCredential(cfg.serviceUrl(), sharedKeyCred, &service.ClientOptions{})
 		if err != nil {
 			return cfg, nil, err
@@ -295,7 +296,6 @@ func (a *azureBackend) azureClient(ep *url.URL) (cfg AzureStoreConfig, client pi
 		if err != nil {
 			return cfg, nil, err
 		}
-		a.sharedKeyCredentials = credentials
 	} else if ep.Scheme == "azure-ad" {
 		// Link to the Azure docs describing what fields are required for active directory auth
 		// https://learn.microsoft.com/en-us/azure/developer/go/azure-sdk-authentication-service-principal?tabs=azure-cli#-option-1-authenticate-with-a-secret
