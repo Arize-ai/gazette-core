@@ -49,7 +49,7 @@ type azureBackend struct {
 	udc       *service.UserDelegationCredential
 	udcExp    *time.Time
 
-	sharedKeyCredentials *service.SharedKeyCredential
+	sharedKeyCredentials *sas.SharedKeyCredential
 }
 
 func (a *azureBackend) Provider() string {
@@ -60,7 +60,7 @@ func (a *azureBackend) Provider() string {
 // https://github.com/Azure/azure-sdk-for-go/blob/main/sdk/storage/azblob/service/examples_test.go#L285
 func (a *azureBackend) SignGet(ep *url.URL, fragment pb.Fragment, d time.Duration) (string, error) {
 	var (
-		sasQueryParams QueryParameters
+		sasQueryParams sas.QueryParameters
 		err            error
 	)
 
@@ -72,12 +72,14 @@ func (a *azureBackend) SignGet(ep *url.URL, fragment pb.Fragment, d time.Duratio
 
 	if ep.Scheme == "azure" {
 		// Note: for arize we assume azure scheme is for blob SAS (as opposed to container SAS in azure-ad case)
+		perms := sas.BlobPermissions{Add: true, Read: true, Write: true}
+
 		sasQueryParams, err = sas.BlobSignatureValues{
 			Protocol:      sas.ProtocolHTTPS, // Users MUST use HTTPS (not HTTP)
 			ExpiryTime:    time.Now().UTC().Add(d),
 			ContainerName: cfg.containerName,
 			BlobName:      blobName,
-			Permissions:   sas.BlobPermissions{Add: true, Read: true, Write: true}.String(),
+			Permissions:   perms.String(),
 		}.SignWithSharedKey(a.sharedKeyCredentials)
 
 		if err != nil {
