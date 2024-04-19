@@ -2,7 +2,6 @@ package fragment
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net/url"
 	"strings"
@@ -153,31 +152,44 @@ func (s *gcsBackend) gcsClient(ep *url.URL) (cfg GSStoreConfig, client *storage.
 	creds, err := google.FindDefaultCredentials(ctx, storage.ScopeFullControl)
 	if err != nil {
 		return
-	} else if creds.JSON == nil {
-		err = fmt.Errorf("use of GCS requires that a service-account private key be supplied with application default credentials")
-		return
-	}
-	conf, err := google.JWTConfigFromJSON(creds.JSON, storage.ScopeFullControl)
-	if err != nil {
-		return
-	}
-	client, err = storage.NewClient(ctx, option.WithTokenSource(conf.TokenSource(ctx)))
-	if err != nil {
-		return
-	}
-	opts = storage.SignedURLOptions{
-		GoogleAccessID: conf.Email,
-		PrivateKey:     conf.PrivateKey,
-	}
-	s.client, s.signedURLOptions = client, opts
+	} else if creds.JSON != nil {
+		conf, err := google.JWTConfigFromJSON(creds.JSON, storage.ScopeFullControl)
+		if err != nil {
+			return
+		}
+		client, err = storage.NewClient(ctx, option.WithTokenSource(conf.TokenSource(ctx)))
+		if err != nil {
+			return
+		}
+		opts = storage.SignedURLOptions{
+			GoogleAccessID: conf.Email,
+			PrivateKey:     conf.PrivateKey,
+		}
+		s.client, s.signedURLOptions = client, opts
 
-	log.WithFields(log.Fields{
-		"ProjectID":      creds.ProjectID,
-		"GoogleAccessID": conf.Email,
-		"PrivateKeyID":   conf.PrivateKeyID,
-		"Subject":        conf.Subject,
-		"Scopes":         conf.Scopes,
-	}).Info("constructed new GCS client")
+		log.WithFields(log.Fields{
+			"ProjectID":      creds.ProjectID,
+			"GoogleAccessID": conf.Email,
+			"PrivateKeyID":   conf.PrivateKeyID,
+			"Subject":        conf.Subject,
+			"Scopes":         conf.Scopes,
+		}).Info("constructed new GCS client")
+	} else {
+		// Possible to use GCS without a service account (e.g. with a GCE instance and workload identity).
+		client, err = storage.NewClient(ctx, option.WithTokenSource(creds.TokenSource))
+		if err != nil {
+			return
+		}
+
+		s.client = client
+
+		// TODO(djd): do i need to form a signed URL options or change this file to work without one?
+		// Looking at SignGet() it seems like I do need to form signed URL options. Just give it a try.
+
+		log.WithFields(log.Fields{
+			"ProjectID": creds.ProjectID,
+		}).Info("constructed new GCS client without JWT")
+	}
 
 	return
 }
