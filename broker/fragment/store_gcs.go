@@ -12,6 +12,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	pb "go.gazette.dev/core/broker/protocol"
 	"golang.org/x/oauth2/google"
+	"golang.org/x/oauth2/jwt"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 )
@@ -132,6 +133,8 @@ func (s *gcsBackend) Remove(ctx context.Context, fragment pb.Fragment) error {
 }
 
 func (s *gcsBackend) gcsClient(ep *url.URL) (cfg GSStoreConfig, client *storage.Client, opts storage.SignedURLOptions, err error) {
+	var conf *jwt.Config
+
 	if err = parseStoreArgs(ep, &cfg); err != nil {
 		return
 	}
@@ -153,7 +156,7 @@ func (s *gcsBackend) gcsClient(ep *url.URL) (cfg GSStoreConfig, client *storage.
 	if err != nil {
 		return
 	} else if creds.JSON != nil {
-		conf, err := google.JWTConfigFromJSON(creds.JSON, storage.ScopeFullControl)
+		conf, err = google.JWTConfigFromJSON(creds.JSON, storage.ScopeFullControl)
 		if err != nil {
 			return
 		}
