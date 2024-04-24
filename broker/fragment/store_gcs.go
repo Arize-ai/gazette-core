@@ -186,8 +186,7 @@ func (s *gcsBackend) gcsClient(ep *url.URL) (cfg GSStoreConfig, client *storage.
 
 		s.client = client
 
-		// TODO(djd): do i need to form a signed URL options or change this file to work without one?
-		// Looking at SignGet() it seems like I do need to form signed URL options. Just give it a try.
+		// Note: SignGet() also works with empty signedURLOptions.
 
 		log.WithFields(log.Fields{
 			"ProjectID": creds.ProjectID,
