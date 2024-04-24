@@ -44,7 +44,7 @@ func (s *gcsBackend) SignGet(ep *url.URL, fragment pb.Fragment, d time.Duration)
 	opts.Method = "GET"
 	opts.Expires = time.Now().Add(d)
 
-	if opt.GoogleAccessID == "" {
+	if opts.GoogleAccessID == "" {
 		return client.Bucket(cfg.bucket).SignedURL(cfg.prefix, &opts)
 	} else {
 		return storage.SignedURL(cfg.bucket, cfg.rewritePath(cfg.prefix, fragment.ContentPath()), &opts)
