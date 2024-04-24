@@ -37,14 +37,18 @@ func (s *gcsBackend) Provider() string {
 }
 
 func (s *gcsBackend) SignGet(ep *url.URL, fragment pb.Fragment, d time.Duration) (string, error) {
-	cfg, _, opts, err := s.gcsClient(ep)
+	cfg, client, opts, err := s.gcsClient(ep)
 	if err != nil {
 		return "", err
 	}
 	opts.Method = "GET"
 	opts.Expires = time.Now().Add(d)
 
-	return storage.SignedURL(cfg.bucket, cfg.rewritePath(cfg.prefix, fragment.ContentPath()), &opts)
+	if opt.GoogleAccessID == "" {
+		return client.Bucket(cfg.bucket).SignedURL(cfg.prefix, &opts)
+	} else {
+		return storage.SignedURL(cfg.bucket, cfg.rewritePath(cfg.prefix, fragment.ContentPath()), &opts)
+	}
 }
 
 func (s *gcsBackend) Exists(ctx context.Context, ep *url.URL, fragment pb.Fragment) (exists bool, err error) {
@@ -184,9 +188,8 @@ func (s *gcsBackend) gcsClient(ep *url.URL) (cfg GSStoreConfig, client *storage.
 			return
 		}
 
-		s.client = client
-
-		// Note: SignGet() also works with empty signedURLOptions.
+		opts = storage.SignedURLOptions{}
+		s.client, s.signedURLOptions = client, opts
 
 		log.WithFields(log.Fields{
 			"ProjectID": creds.ProjectID,
