@@ -46,10 +46,6 @@ func (s *gcsBackend) SignGet(ep *url.URL, fragment pb.Fragment, d time.Duration)
 
 	if opts.GoogleAccessID == "" {
 		// workload identity approach
-		log.WithFields(log.Fields{
-			"bucket": cfg.bucket,
-			"prefix": cfg.prefix,
-		}).Info("SignGet with workload identity approach")
 		return client.Bucket(cfg.bucket).SignedURL(cfg.prefix, &opts)
 	} else {
 		return storage.SignedURL(cfg.bucket, cfg.rewritePath(cfg.prefix, fragment.ContentPath()), &opts)
