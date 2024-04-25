@@ -44,12 +44,7 @@ func (s *gcsBackend) SignGet(ep *url.URL, fragment pb.Fragment, d time.Duration)
 	opts.Method = "GET"
 	opts.Expires = time.Now().Add(d)
 
-	if opts.GoogleAccessID == "" {
-		// workload identity approach
-		return client.Bucket(cfg.bucket).SignedURL(cfg.rewritePath(cfg.prefix, fragment.ContentPath()), &opts)
-	} else {
-		return storage.SignedURL(cfg.bucket, cfg.rewritePath(cfg.prefix, fragment.ContentPath()), &opts)
-	}
+	return client.Bucket(cfg.bucket).SignedURL(cfg.rewritePath(cfg.prefix, fragment.ContentPath()), &opts)
 }
 
 func (s *gcsBackend) Exists(ctx context.Context, ep *url.URL, fragment pb.Fragment) (exists bool, err error) {
@@ -189,7 +184,8 @@ func (s *gcsBackend) gcsClient(ep *url.URL) (cfg GSStoreConfig, client *storage.
 			return
 		}
 
-		// workload identity approach which aligns with a path in SignGet() method
+		// workload identity approach which SignGet() method accepts if you have
+		// "iam.serviceAccounts.signBlob" permissions against your service account.
 		opts = storage.SignedURLOptions{}
 		s.client, s.signedURLOptions = client, opts
 
