@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +28,8 @@ type GSStoreConfig struct {
 	RewriterConfig
 }
 
+var gcs_do_not_sign_urls = os.Getenv("GCS_DO_NOT_SIGN_URLS")
+
 type gcsBackend struct {
 	client           *storage.Client
 	signedURLOptions storage.SignedURLOptions
@@ -40,17 +43,26 @@ func (s *gcsBackend) Provider() string {
 func (s *gcsBackend) SignGet(ep *url.URL, fragment pb.Fragment, d time.Duration) (string, error) {
 	log.WithFields(log.Fields{"ep": ep.String(), "fragment": fragment.ContentPath()}).Info("*** DJD1 SignGet() called")
 
-	cfg, _, _, err := s.gcsClient(ep)
+	cfg, client, ops, err := s.gcsClient(ep)
 	if err != nil {
 		return "", err
 	}
 
-	u := &url.URL{
-		Path: fmt.Sprintf("/%s/%s", cfg.bucket, cfg.rewritePath(cfg.prefix, fragment.ContentPath())),
-	}
+	if gcs_do_not_sign_urls == "true" {
+		u := &url.URL{
+			Path: fmt.Sprintf("/%s/%s", cfg.bucket, cfg.rewritePath(cfg.prefix, fragment.ContentPath())),
+		}
+		u.Scheme = "https"
+		u.Host = PathStyle().host(bucket)
 
-	log.WithFields(log.Fields{"url": u.String()}).Info("*** DJD2 SignGet()")
-	return u.String(), nil
+		log.WithFields(log.Fields{"url": u.String()}).Info("*** DJD2 SignGet()")
+		return u.String(), nil
+	} else {
+		opts.Method = "GET"
+		opts.Expires = time.Now().Add(d)
+
+		return client.Bucket(cfg.bucket).SignedURL(cfg.rewritePath(cfg.prefix, fragment.ContentPath()), &opts)
+	}
 }
 
 func (s *gcsBackend) Exists(ctx context.Context, ep *url.URL, fragment pb.Fragment) (exists bool, err error) {
