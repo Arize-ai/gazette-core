@@ -2,6 +2,7 @@ package fragment
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/url"
 	"strings"
@@ -39,19 +40,17 @@ func (s *gcsBackend) Provider() string {
 func (s *gcsBackend) SignGet(ep *url.URL, fragment pb.Fragment, d time.Duration) (string, error) {
 	log.WithFields(log.Fields{"ep": ep.String(), "fragment": fragment.ContentPath()}).Info("*** DJD1 SignGet() called")
 
-	// test start
 	cfg, client, opts, err := s.gcsClient(ep)
 	if err != nil {
 		return "", err
 	}
-	opts.Method = "GET"
-	opts.Expires = time.Now().Add(d)
 
-	url, err := client.Bucket(cfg.bucket).SignedURL(cfg.rewritePath(cfg.prefix, fragment.ContentPath()), &opts)
-	log.WithFields(log.Fields{"url": url}).Info("*** DJD2 SignGet()")
-	// test end
+	u := &url.URL{
+		Path: fmt.Sprintf("/%s/%s", cfg.bucket, cfg.rewritePath(cfg.prefix, fragment.ContentPath())),
+	}
 
-	return ep.String(), nil
+	log.WithFields(log.Fields{"url": u.String()}).Info("*** DJD2 SignGet()")
+	return u.String(), nil
 }
 
 func (s *gcsBackend) Exists(ctx context.Context, ep *url.URL, fragment pb.Fragment) (exists bool, err error) {
