@@ -40,7 +40,7 @@ func (s *gcsBackend) Provider() string {
 func (s *gcsBackend) SignGet(ep *url.URL, fragment pb.Fragment, d time.Duration) (string, error) {
 	log.WithFields(log.Fields{"ep": ep.String(), "fragment": fragment.ContentPath()}).Info("*** DJD1 SignGet() called")
 
-	cfg, client, opts, err := s.gcsClient(ep)
+	cfg, _, _, err := s.gcsClient(ep)
 	if err != nil {
 		return "", err
 	}
