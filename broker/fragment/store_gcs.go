@@ -43,7 +43,7 @@ func (s *gcsBackend) Provider() string {
 func (s *gcsBackend) SignGet(ep *url.URL, fragment pb.Fragment, d time.Duration) (string, error) {
 	log.WithFields(log.Fields{"ep": ep.String(), "fragment": fragment.ContentPath()}).Info("*** DJD1 SignGet() called")
 
-	cfg, client, ops, err := s.gcsClient(ep)
+	cfg, client, opts, err := s.gcsClient(ep)
 	if err != nil {
 		return "", err
 	}
@@ -53,7 +53,7 @@ func (s *gcsBackend) SignGet(ep *url.URL, fragment pb.Fragment, d time.Duration)
 			Path: fmt.Sprintf("/%s/%s", cfg.bucket, cfg.rewritePath(cfg.prefix, fragment.ContentPath())),
 		}
 		u.Scheme = "https"
-		u.Host = PathStyle().host(bucket)
+		u.Host = storage.PathStyle().host(cfg.bucket)
 
 		log.WithFields(log.Fields{"url": u.String()}).Info("*** DJD2 SignGet()")
 		return u.String(), nil
