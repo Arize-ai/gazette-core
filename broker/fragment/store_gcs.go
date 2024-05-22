@@ -53,7 +53,7 @@ func (s *gcsBackend) SignGet(ep *url.URL, fragment pb.Fragment, d time.Duration)
 			Path: fmt.Sprintf("/%s/%s", cfg.bucket, cfg.rewritePath(cfg.prefix, fragment.ContentPath())),
 		}
 		u.Scheme = "https"
-		u.Host = storage.PathStyle().host(cfg.bucket)
+		u.Host = "storage.googleapis.com"
 
 		log.WithFields(log.Fields{"url": u.String()}).Info("*** DJD2 SignGet()")
 		return u.String(), nil
