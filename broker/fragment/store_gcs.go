@@ -37,14 +37,18 @@ func (s *gcsBackend) Provider() string {
 }
 
 func (s *gcsBackend) SignGet(ep *url.URL, fragment pb.Fragment, d time.Duration) (string, error) {
-	cfg, client, opts, err := s.gcsClient(ep)
-	if err != nil {
-		return "", err
-	}
-	opts.Method = "GET"
-	opts.Expires = time.Now().Add(d)
+	log.Fatal("*** DJD SignGet() called")
+	return "", nil
+	/*
+		cfg, client, opts, err := s.gcsClient(ep)
+		if err != nil {
+			return "", err
+		}
+		opts.Method = "GET"
+		opts.Expires = time.Now().Add(d)
 
-	return client.Bucket(cfg.bucket).SignedURL(cfg.rewritePath(cfg.prefix, fragment.ContentPath()), &opts)
+		return client.Bucket(cfg.bucket).SignedURL(cfg.rewritePath(cfg.prefix, fragment.ContentPath()), &opts)
+	*/
 }
 
 func (s *gcsBackend) Exists(ctx context.Context, ep *url.URL, fragment pb.Fragment) (exists bool, err error) {
