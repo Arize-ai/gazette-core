@@ -72,6 +72,8 @@ func (cmdServe) Execute(args []string) error {
 	broker.MaxAppendRate = int64(Config.Broker.MaxAppendRate)
 	pb.MaxReplication = int32(Config.Broker.MaxReplication)
 	fragment.DisableStores = Config.Broker.DisableStores
+
+	log.WithFields(log.Fields{"DisableSignedUrls": Config.Broker.DisableSignedUrls}).Info("*** DJD ***")
 	fragment.DisableSignedUrls = Config.Broker.DisableSignedUrls
 
 	var (
