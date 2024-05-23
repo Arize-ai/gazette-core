@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -28,8 +27,6 @@ type GSStoreConfig struct {
 	RewriterConfig
 }
 
-var gcs_do_not_sign_urls = os.Getenv("GCS_DO_NOT_SIGN_URLS")
-
 type gcsBackend struct {
 	client           *storage.Client
 	signedURLOptions storage.SignedURLOptions
@@ -46,7 +43,7 @@ func (s *gcsBackend) SignGet(ep *url.URL, fragment pb.Fragment, d time.Duration)
 		return "", err
 	}
 
-	if gcs_do_not_sign_urls == "true" {
+	if SignedUrlsOff {
 		u := &url.URL{
 			Path: fmt.Sprintf("/%s/%s", cfg.bucket, cfg.rewritePath(cfg.prefix, fragment.ContentPath())),
 		}

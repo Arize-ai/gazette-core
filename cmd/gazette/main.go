@@ -32,6 +32,7 @@ var Config = new(struct {
 		MinAppendRate  uint32        `long:"min-append-rate" env:"MIN_APPEND_RATE" default:"65536" description:"Min rate (in bytes-per-sec) at which a client may stream Append RPC content. RPCs unable to sustain this rate are aborted"`
 		DisableStores  bool          `long:"disable-stores" env:"DISABLE_STORES" description:"Disable use of any configured journal fragment stores. The broker will neither list or persist remote fragments, and all data is discarded on broker exit."`
 		WatchDelay     time.Duration `long:"watch-delay" env:"WATCH_DELAY" default:"30ms" description:"Delay applied to the application of watched Etcd events. Larger values amortize the processing of fast-changing Etcd keys."`
+		SignedUrlsOff  bool          `long:"signed-urls-off" env:"SIGNED_URLS_OFF" description:"When a signed URL is requested, return an unsigned URL instead. This is useful when clients do not require the signing."`
 	} `group:"Broker" namespace:"broker" env-namespace:"BROKER"`
 
 	Etcd struct {
@@ -71,6 +72,7 @@ func (cmdServe) Execute(args []string) error {
 	broker.MaxAppendRate = int64(Config.Broker.MaxAppendRate)
 	pb.MaxReplication = int32(Config.Broker.MaxReplication)
 	fragment.DisableStores = Config.Broker.DisableStores
+	fragment.SignedUrlsOff = Config.Broker.SignedUrlsOff
 
 	var (
 		lo   = pb.NewJournalClient(srv.GRPCLoopback)
