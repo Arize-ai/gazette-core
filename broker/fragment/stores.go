@@ -22,7 +22,7 @@ import (
 var DisableStores bool = false
 
 // Whether to return an unsigned URL when a signed URL is requested. Useful when clients do not require the signing.
-var SignedUrlsOff bool = false
+var DisableSignedUrls bool = false
 
 type backend interface {
 	Provider() string

@@ -43,18 +43,20 @@ func (s *gcsBackend) SignGet(ep *url.URL, fragment pb.Fragment, d time.Duration)
 		return "", err
 	}
 
-	if SignedUrlsOff {
+	if DisableSignedUrls {
 		u := &url.URL{
 			Path: fmt.Sprintf("/%s/%s", cfg.bucket, cfg.rewritePath(cfg.prefix, fragment.ContentPath())),
 		}
 		u.Scheme = "https"
 		u.Host = "storage.googleapis.com"
 
+		log.Info("*** DJD signed urls disabled ***")
 		return u.String(), nil
 	} else {
 		opts.Method = "GET"
 		opts.Expires = time.Now().Add(d)
 
+		log.Info("*** DJD signed urls enabled ***")
 		return client.Bucket(cfg.bucket).SignedURL(cfg.rewritePath(cfg.prefix, fragment.ContentPath()), &opts)
 	}
 }
