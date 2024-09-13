@@ -175,7 +175,7 @@ func (s *gcsBackend) gcsClient(ep *url.URL) (cfg GSStoreConfig, client *storage.
 		return
 	}
 
-	// Arize - best effort to determine if JWT credentials are for external account
+	// best effort to determine if JWT credentials are for external account
 	externalAccount := false
 	if creds.JSON != nil {
 		var f credentialsFile
