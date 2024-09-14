@@ -170,7 +170,7 @@ func (s *gcsBackend) gcsClient(ep *url.URL) (cfg GSStoreConfig, client *storage.
 	}
 	var ctx = context.Background()
 
-	creds, err := google.FindDefaultCredentials(ctx, storage.ScopeFullControl)
+	creds, err := google.FindDefaultCredentials(ctx, "https://www.googleapis.com/auth/cloud-platform")
 	if err != nil {
 		return
 	}
