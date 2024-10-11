@@ -128,6 +128,8 @@ func (sc Cmd) Execute(args []string) error {
 	// Arize avoidance of using signed URLs.
 	client.SkipSignedURLs = bc.Consumer.SkipSignedURLs
 
+	log.WithFields(log.Fields{"client": client.SkipSignedURLs, "flag": bc.Consumer.SkipSignedURLs}).Info("** DJD skipped signed urls")
+
 	if bc.Broker.Cache.Size <= 0 {
 		log.Warn("--broker.cache.size is disabled; consider setting > 0")
 	}
