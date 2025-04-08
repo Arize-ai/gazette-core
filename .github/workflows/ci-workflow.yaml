@@ -36,7 +36,7 @@ jobs:
         run: gcloud info
       #- name: Login to GitHub container registry
       #  run: |
-      #    echo "${{ secrets.REGISTRY }}" | \
+      #    echo "${{ secrets.GITHUB_TOKEN }}" | \
       #      docker login --username ${{ github.actor }} --password-stdin ghcr.io
 
       - uses: actions/setup-go@v4
