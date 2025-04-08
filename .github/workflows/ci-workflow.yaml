@@ -34,32 +34,19 @@ jobs:
 
       - name: 'Use gcloud CLI'
         run: gcloud info
-      #- name: Login to GitHub container registry
-      #  run: |
-      #    echo "${{ secrets.GITHUB_TOKEN }}" | \
-      #      docker login --username ${{ github.actor }} --password-stdin ghcr.io
 
       - uses: actions/setup-go@v4
       - run: sudo apt install -y protobuf-compiler librocksdb-dev libsqlite3-dev etcd-server
       - run: echo "VERSION=$(git describe --dirty --tags)" >> "$GITHUB_ENV"
 
       - run: make go-test-ci
-      - run: make go-build # go-build-arm64
+      - run: make go-build
 
       - uses: docker/build-push-action@v5
         with:
           context: .build
           file: Dockerfile
           target: broker
-          platforms: linux/amd64 # ,linux/arm64
-          tags: "ghcr.io/gazette/broker:${{ env.VERSION }}"
+          platforms: linux/amd64
+          tags: "${{ secrets.REGISTRY_PATH }}/gazette/broker:${{ env.VERSION }}"
           push: true
-
-      #- uses: docker/build-push-action@v5
-      #  with:
-      #    context: .build
-      #    file: Dockerfile
-      #    target: examples
-      #    platforms: linux/amd64
-      #    tags: "ghcr.io/gazette/examples:${{ env.VERSION }}"
-      #    push: true
