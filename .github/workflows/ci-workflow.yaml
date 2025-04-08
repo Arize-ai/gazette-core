@@ -39,7 +39,11 @@ jobs:
       - run: sudo apt install -y protobuf-compiler librocksdb-dev libsqlite3-dev etcd-server
       - run: |
           sha=${{ github.sha }}
-          echo "VERSION=0.99.0-arize-${sha:0:7}" >> "$GITHUB_ENV"
+          if [[ '${{ github.ref }}' == 'refs/heads/arize' ]]; then
+                version="0.99.0-arize-${sha:0:7}"
+          else [[ '${{ github.ref }}' == *'arize'* ]]; then
+                version="0.99.0-dev-${sha:0:7}"
+          echo "VERSION=${version}" >> "$GITHUB_ENV"
 
       - run: make go-test-ci
       - run: make go-build
