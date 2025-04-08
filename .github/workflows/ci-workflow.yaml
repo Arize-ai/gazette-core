@@ -41,8 +41,9 @@ jobs:
           sha=${{ github.sha }}
           if [[ '${{ github.ref }}' == 'refs/heads/arize' ]]; then
                 version="0.99.0-arize-${sha:0:7}"
-          else [[ '${{ github.ref }}' == *'arize'* ]]; then
+          else
                 version="0.99.0-dev-${sha:0:7}"
+          fi
           echo "VERSION=${version}" >> "$GITHUB_ENV"
 
       - run: make go-test-ci
