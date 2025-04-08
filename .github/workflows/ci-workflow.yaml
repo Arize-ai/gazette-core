@@ -37,7 +37,7 @@ jobs:
 
       - uses: actions/setup-go@v4
       - run: sudo apt install -y protobuf-compiler librocksdb-dev libsqlite3-dev etcd-server
-      - run: echo "VERSION=$(git describe --dirty --tags)" >> "$GITHUB_ENV"
+      - run: echo "VERSION=0.99.0-arize-${sha:0:7}" >> "$GITHUB_ENV"
 
       - run: make go-test-ci
       - run: make go-build
