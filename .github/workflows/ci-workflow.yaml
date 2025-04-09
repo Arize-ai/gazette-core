@@ -40,9 +40,9 @@ jobs:
       - run: |
           sha=${{ github.sha }}
           if [[ '${{ github.ref }}' == 'refs/heads/arize' ]]; then
-                version="0.99.0-arize-${sha:0:7}"
+                version="arize-${sha:0:7}"
           else
-                version="0.99.0-dev-${sha:0:7}"
+                version="dev-${sha:0:7}"
           fi
           echo "VERSION=${version}" >> "$GITHUB_ENV"
 
