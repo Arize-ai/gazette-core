@@ -49,6 +49,7 @@ jobs:
       - run: make go-test-ci
       - run: make go-build
 
+      - run: gcloud auth configure-docker ${{ secrets.REGISTRY }}
       - uses: docker/build-push-action@v5
         with:
           context: .build
