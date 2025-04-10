@@ -14,8 +14,11 @@ RUN apt-get update -y \
 
 COPY ${TARGETARCH}/gazette ${TARGETARCH}/gazctl /usr/local/bin 
 
+# Arize remove ubuntu user and use gazette user as default (similar to what we had before)
+RUN userdel -r ubuntu
+
 # Run as non-privileged "gazette" user.
-RUN useradd gazette --create-home --shell /usr/sbin/nologin
+RUN useradd -u 1000 -g 1000 gazette --create-home --shell /usr/sbin/nologin
 USER gazette
 WORKDIR /home/gazette
 
