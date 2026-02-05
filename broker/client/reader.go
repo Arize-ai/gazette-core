@@ -68,7 +68,7 @@ func NewReader(ctx context.Context, client pb.RoutedJournalClient, req pb.ReadRe
 
 // Read from the journal. If this is the first Read of the Reader, a Read RPC is started.
 func (r *Reader) Read(p []byte) (n int, err error) {
-	log.Warn("Reader.Read start")
+	log.WithField("DoNotProxy", r.Request.DoNotProxy).Warn("Reader.Read start")
 	// If we have an open direct reader of a persisted fragment, delegate to it.
 	if r.direct != nil {
 
@@ -211,6 +211,7 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 	switch r.Response.Status {
 	case pb.Status_OK:
 		if err != io.EOF {
+			log.Warn("Reader.Read return 8")
 			panic(err.Error()) // Status_OK implies graceful stream closure.
 		}
 	case pb.Status_JOURNAL_NOT_FOUND:
