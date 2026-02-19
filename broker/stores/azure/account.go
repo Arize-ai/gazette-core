@@ -1,12 +1,14 @@
 package azure
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"os"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
@@ -119,7 +121,58 @@ func NewAccount(ep *url.URL) (stores.Store, error) {
 		authMethod = "workload identity / default chain"
 	}
 
-	return newADStoreFromCredential(tenantID, storageAccount, container, prefix, blobDomain, args, credentials, authMethod)
+	var refreshFn = func(credential azblob.TokenCredential) time.Duration {
+		if token, err := credentials.GetToken(
+			context.Background(),
+			policy.TokenRequestOptions{
+				TenantID: tenantID,
+				Scopes:   []string{"https://storage.azure.com/.default"},
+			},
+		); err != nil {
+			log.WithFields(log.Fields{
+				"err":    err,
+				"tenant": tenantID,
+			}).Errorf("failed to refresh Azure credential (will retry)")
+			return time.Minute
+		} else {
+			credential.SetToken(token.Token)
+			return token.ExpiresOn.Sub(time.Now().Add(time.Minute))
+		}
+	}
+	var accessKey = azblob.NewTokenCredential("", refreshFn)
+
+	client, err := service.NewClient(
+		azureStorageURL(storageAccount, blobDomain),
+		credentials,
+		&service.ClientOptions{},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	var adStoreInstance = &adStore{
+		storeBase: storeBase{
+			storageAccount: storageAccount,
+			blobDomain:     blobDomain,
+			container:      container,
+			prefix:         prefix,
+			args:           args,
+			pipeline:       azblob.NewPipeline(accessKey, azblob.PipelineOptions{}),
+		},
+		tenantID: tenantID,
+		client:   client,
+	}
+
+	log.WithFields(log.Fields{
+		"tenant":         tenantID,
+		"storageAccount": storageAccount,
+		"blobDomain":     blobDomain,
+		"container":      container,
+		"prefix":         prefix,
+		"auth":           authMethod,
+	}).Info("constructed new Azure AD storage client (azure://)")
+
+	return adStoreInstance, nil
 }
 
 // SignGet returns a signed URL for GET operations using Shared Key signing
