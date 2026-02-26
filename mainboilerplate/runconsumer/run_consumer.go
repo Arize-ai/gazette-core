@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -24,6 +25,11 @@ import (
 	"go.gazette.dev/core/auth"
 	"go.gazette.dev/core/broker/client"
 	pb "go.gazette.dev/core/broker/protocol"
+	"go.gazette.dev/core/broker/stores"
+	"go.gazette.dev/core/broker/stores/azure"
+	"go.gazette.dev/core/broker/stores/fs"
+	"go.gazette.dev/core/broker/stores/gcs"
+	"go.gazette.dev/core/broker/stores/s3"
 	"go.gazette.dev/core/consumer"
 	pc "go.gazette.dev/core/consumer/protocol"
 	mbp "go.gazette.dev/core/mainboilerplate"
@@ -86,10 +92,13 @@ type Config interface {
 type BaseConfig struct {
 	Consumer struct {
 		mbp.ServiceConfig
-		Limit          uint32        `long:"limit" env:"LIMIT" default:"32" description:"Maximum number of Shards this consumer process will allocate"`
-		MaxHotStandbys uint32        `long:"max-hot-standbys" env:"MAX_HOT_STANDBYS" default:"3" description:"Maximum effective hot standbys of any one shard, which upper-bounds its stated hot-standbys."`
-		WatchDelay     time.Duration `long:"watch-delay" env:"WATCH_DELAY" default:"30ms" description:"Delay applied to the application of watched Etcd events. Larger values amortize the processing of fast-changing Etcd keys."`
-		AuthKeys       string        `long:"auth-keys" env:"AUTH_KEYS" description:"Whitespace or comma separated, base64-encoded keys used to sign (first key) and verify (all keys) Authorization tokens." json:"-"`
+		Limit                  uint32        `long:"limit" env:"LIMIT" default:"32" description:"Maximum number of Shards this consumer process will allocate"`
+		MaxHotStandbys         uint32        `long:"max-hot-standbys" env:"MAX_HOT_STANDBYS" default:"3" description:"Maximum effective hot standbys of any one shard, which upper-bounds its stated hot-standbys."`
+		WatchDelay             time.Duration `long:"watch-delay" env:"WATCH_DELAY" default:"30ms" description:"Delay applied to the application of watched Etcd events. Larger values amortize the processing of fast-changing Etcd keys."`
+		SkipSignedURLs         bool          `long:"skip-signed-urls" env:"SKIP_SIGNED_URLS" description:"When a signed URL is received, use fragment info instead to retrieve data with auth header. This is useful when clients do not wish/require the signing."`
+		AuthKeys               string        `long:"auth-keys" env:"AUTH_KEYS" description:"Whitespace or comma separated, base64-encoded keys used to sign (first key) and verify (all keys) Authorization tokens." json:"-"`
+		AWSAccessKeyIDPath     string        `long:"aws-access-key-id-path" env:"AWS_ACCESS_KEY_ID_PATH" default:"" description:"file path to the aws access key id secret"`
+		AWSSecretAccessKeyPath string        `long:"aws-secret-access-key-path" env:"AWS_SECRET_ACCESS_KEY_PATH" default:"" description:"file path to the aws secret access key secret"`
 	} `group:"Consumer" namespace:"consumer" env-namespace:"CONSUMER"`
 
 	Broker struct {
@@ -167,6 +176,39 @@ func (sc Cmd) Execute(args []string) error {
 		sc.WrapListener,
 	)
 	mbp.Must(err, "building Server instance")
+
+	// Arize: use direct bucket access instead of signed URLs.
+	client.SkipSignedURLs = bc.Consumer.SkipSignedURLs
+
+	if bc.Consumer.SkipSignedURLs {
+		// Register store providers only when using direct bucket access.
+		// These are used by OpenUnsignedFragmentURL in broker/client/reader.go.
+		// The store health checks are only enabled when we are not using signed URLs
+		// and OpenUnsignedFragmentURL is called.
+		log.Warn("registering store providers as not using signed URLs")
+		stores.RegisterProviders(map[string]stores.Constructor{
+			"azure":    azure.NewAccount,
+			"azure-ad": azure.NewAD,
+			"file":     fs.New,
+			"gs":       gcs.New,
+			"s3":       s3.New,
+		})
+		stores.DisableSignedUrls = true
+	}
+
+	// Load AWS credentials from file paths if both are configured.
+	if bc.Consumer.AWSAccessKeyIDPath != "" && bc.Consumer.AWSSecretAccessKeyPath != "" {
+		accessKeyID, err := os.ReadFile(bc.Consumer.AWSAccessKeyIDPath)
+		mbp.Must(err, "reading AWS access key ID from file")
+
+		secretAccessKey, err := os.ReadFile(bc.Consumer.AWSSecretAccessKeyPath)
+		mbp.Must(err, "reading AWS secret access key from file")
+
+		mbp.Must(os.Setenv("AWS_ACCESS_KEY_ID", strings.TrimSpace(string(accessKeyID))),
+			"setting AWS_ACCESS_KEY_ID environment variable")
+		mbp.Must(os.Setenv("AWS_SECRET_ACCESS_KEY", strings.TrimSpace(string(secretAccessKey))),
+			"setting AWS_SECRET_ACCESS_KEY environment variable")
+	}
 
 	if !bc.Diagnostics.Private {
 		// Expose diagnostics over the main service port.
@@ -258,7 +300,8 @@ func (sc Cmd) Execute(args []string) error {
 func Main(app Application) {
 	var cfg = app.NewConfig()
 
-	var parser = flags.NewParser(cfg, flags.Default)
+	var parser = flags.NewParser(cfg, flags.Default|flags.AllowBoolValues)
+	log.Info("Starting consumer...")
 	_, _ = parser.AddCommand("serve", "Serve as Gazette consumer", `
 		serve a Gazette consumer with the provided configuration, until signaled to
 		exit (via SIGTERM). Upon receiving a signal, the consumer will seek to discharge

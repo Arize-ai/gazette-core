@@ -14,6 +14,9 @@ var (
 	constructors = make(map[string]Constructor)
 	stores       = make(map[pb.FragmentStore]*ActiveStore)
 	storesMu     sync.RWMutex
+
+	// Whether to return an unsigned URL when a signed URL is requested. Useful when clients do not require the signing.
+	DisableSignedUrls bool = false
 )
 
 // RegisterProviders registers store constructors for different storage schemes.
@@ -72,7 +75,7 @@ func Get(fs pb.FragmentStore) *ActiveStore {
 		stores[fs] = active
 		activeStoresGauge.Set(float64(len(stores)))
 		go checkLoop(stores, fs, 0) // Start health checks.
-		log.WithFields(log.Fields{"store": fs, "n": len(stores)}).Info("started fragment store")
+		log.WithFields(log.Fields{"store": fs, "n": len(stores)}).Warn("started fragment store")
 	}
 
 	return active

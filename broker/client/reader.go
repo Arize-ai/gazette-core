@@ -14,8 +14,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"go.gazette.dev/core/broker/codecs"
 	pb "go.gazette.dev/core/broker/protocol"
+	"go.gazette.dev/core/broker/stores"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+)
+
+var (
+	SkipSignedURLs = false // capability to avoid use of signed URLs.
 )
 
 // Reader adapts a Read RPC to the io.Reader interface. The first byte read from
@@ -174,9 +179,16 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 
 	// If the frame preceding EOF provided a fragment URL, open it directly.
 	if !r.Request.MetadataOnly && r.Response.Status == pb.Status_OK && r.Response.FragmentUrl != "" {
-		if r.direct, err = OpenFragmentURL(r.ctx, *r.Response.Fragment,
-			r.Request.Offset, r.Response.FragmentUrl); err == nil {
-			n, err = r.Read(p) // Recurse to attempt read against opened |r.direct|.
+		if SkipSignedURLs {
+			if r.direct, err = OpenUnsignedFragmentURL(r.ctx, *r.Response.Fragment,
+				r.Request.Offset); err == nil {
+				n, err = r.Read(p) // Recurse to attempt read against opened |r.direct|.
+			}
+		} else {
+			if r.direct, err = OpenFragmentURL(r.ctx, *r.Response.Fragment,
+				r.Request.Offset, r.Response.FragmentUrl); err == nil {
+				n, err = r.Read(p) // Recurse to attempt read against opened |r.direct|.
+			}
 		}
 		return
 	}
@@ -287,6 +299,23 @@ func OpenFragmentURL(ctx context.Context, fragment pb.Fragment, offset int64, ur
 	}
 
 	return NewFragmentReader(resp.Body, fragment, offset)
+}
+
+func OpenUnsignedFragmentURL(ctx context.Context, fragment pb.Fragment, offset int64) (*FragmentReader, error) {
+	var activeStore = stores.Get(fragment.BackingStore)
+	activeStore.Mark.Store(true)
+
+	var rdr, err = activeStore.Get(ctx, fragment.ContentPath())
+	if err != nil {
+		return nil, err
+	}
+
+	// Record metrics related to opening the fragment.
+	var labels = fragmentLabels(fragment)
+	fragmentOpen.With(labels).Inc()
+	fragmentOpenBytes.With(labels).Add(float64(fragment.End - fragment.Begin))
+
+	return NewFragmentReader(rdr, fragment, offset)
 }
 
 // NewFragmentReader wraps a io.ReadCloser of raw Fragment bytes with a
