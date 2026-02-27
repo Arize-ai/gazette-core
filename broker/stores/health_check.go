@@ -90,7 +90,7 @@ func runCheck(ctx context.Context, s *ActiveStore) error {
 		testContent = "health-check\n"
 	)
 
-	if DisableStoreHealthCheck {
+	if ForceStoreHealthCheckToHealthy {
 		return nil
 	}
 

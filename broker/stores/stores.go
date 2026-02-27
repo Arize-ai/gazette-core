@@ -18,8 +18,8 @@ var (
 	// Whether to return an unsigned URL when a signed URL is requested. Useful when clients do not require the signing.
 	DisableSignedUrls bool = false
 
-	// Whether to disable the health check of fragment stores.
-	DisableStoreHealthCheck bool = false
+	// Whether to force the health check of fragment stores to healthy.
+	ForceStoreHealthCheckToHealthy bool = false
 )
 
 // RegisterProviders registers store constructors for different storage schemes.
