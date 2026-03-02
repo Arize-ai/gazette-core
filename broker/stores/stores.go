@@ -78,7 +78,7 @@ func Get(fs pb.FragmentStore) *ActiveStore {
 		stores[fs] = active
 		activeStoresGauge.Set(float64(len(stores)))
 		go checkLoop(stores, fs, 0) // Start health checks.
-		log.WithFields(log.Fields{"store": fs, "n": len(stores)}).Warn("started fragment store")
+		log.WithFields(log.Fields{"store": fs, "n": len(stores), "forceStoreHealthCheckToHealthy": ForceStoreHealthCheckToHealthy}).Warn("started fragment store")
 	}
 
 	return active
