@@ -19,7 +19,7 @@ var (
 	DisableSignedUrls bool = false
 
 	// Whether to force the health check of fragment stores to healthy.
-	ForceStoreHealthCheckToHealthy bool = false
+	ForceStoreHealthCheckToHealthy bool = true
 )
 
 // RegisterProviders registers store constructors for different storage schemes.
