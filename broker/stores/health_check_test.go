@@ -199,6 +199,8 @@ func TestHealthChecks(t *testing.T) {
 				"s3": tt.setupStore(server),
 			})
 
+			ForceStoreHealthCheckToHealthy = false
+
 			// Get store - this starts health check
 			store := Get(pb.FragmentStore("s3://test/"))
 			require.NoError(t, store.initErr)
