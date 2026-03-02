@@ -49,7 +49,7 @@ var Config = new(struct {
 		AuthKeys                       string        `long:"auth-keys" env:"AUTH_KEYS" description:"Whitespace or comma separated, base64-encoded keys used to sign (first key) and verify (all keys) Authorization tokens." json:"-"`
 		AutoSuspend                    bool          `long:"auto-suspend" env:"AUTO_SUSPEND" description:"Automatically suspend journals which have persisted all fragments"`
 		DisableSignedUrls              bool          `long:"disable-signed-urls" env:"DISABLE_SIGNED_URLS" description:"When a signed URL is requested, return an unsigned URL instead. This is useful when clients do not require the signing."`
-		ForceStoreHealthCheckToHealthy bool          `long:"force-store-health-check-to-healthy" env:"FORCE_STORE_HEALTH_CHECK_TO_HEALTHY" description:"Force the health check of fragment stores to healthy"`
+		ForceStoreHealthCheckToHealthy bool          `long:"force-store-health-check-to-healthy" env:"FORCE_STORE_HEALTH_CHECK_TO_HEALTHY" default:"true" description:"Force the health check of fragment stores to healthy"`
 	} `group:"Broker" namespace:"broker" env-namespace:"BROKER"`
 
 	Etcd struct {
