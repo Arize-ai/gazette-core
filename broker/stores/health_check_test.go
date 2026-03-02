@@ -25,6 +25,8 @@ func (errorReader) Read([]byte) (int, error) {
 func TestHealthChecks(t *testing.T) {
 	const testContent = "health-check\n"
 
+	ForceStoreHealthCheckToHealthy = false
+
 	// Channel to coordinate the "Failure Then Success" test
 	var failureThenSuccessCh = make(chan struct{})
 
@@ -198,8 +200,6 @@ func TestHealthChecks(t *testing.T) {
 			RegisterProviders(map[string]Constructor{
 				"s3": tt.setupStore(server),
 			})
-
-			ForceStoreHealthCheckToHealthy = false
 
 			// Get store - this starts health check
 			store := Get(pb.FragmentStore("s3://test/"))
