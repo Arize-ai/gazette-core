@@ -1,12 +1,15 @@
 package azure
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"os"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/sas"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
 	"github.com/Azure/azure-storage-blob-go/azblob"
@@ -15,13 +18,14 @@ import (
 )
 
 // accountStore implements the Store interface for Azure Blob Storage
-// using Shared Key authentication (azure:// scheme)
+// using Shared Key authentication (azure:// scheme).
 type accountStore struct {
 	storeBase
 	sasKey *service.SharedKeyCredential
 }
 
-// NewAccount creates a new Azure Account authenticated Store from the provided URL.
+// NewAccount creates an azure:// store from the provided URL.
+// It will use managed identity if the account key is not set.
 func NewAccount(ep *url.URL) (stores.Store, error) {
 	var args StoreQueryArgs
 
@@ -34,9 +38,17 @@ func NewAccount(ep *url.URL) (stores.Store, error) {
 
 	var storageAccount = os.Getenv("AZURE_ACCOUNT_NAME")
 	var accountKey = os.Getenv("AZURE_ACCOUNT_KEY")
+	var tenantID = os.Getenv("AZURE_TENANT_ID")
+	var clientID = os.Getenv("AZURE_CLIENT_ID")
 
-	if storageAccount == "" || accountKey == "" {
-		return nil, fmt.Errorf("AZURE_ACCOUNT_NAME and AZURE_ACCOUNT_KEY must be set for azure:// URLs")
+	if storageAccount == "" {
+		return nil, fmt.Errorf("AZURE_ACCOUNT_NAME must be set for azure:// URLs")
+	}
+	if accountKey == "" && (tenantID == "" || clientID == "") {
+		return nil, fmt.Errorf("AZURE_ACCOUNT_KEY or both AZURE_CLIENT_ID and AZURE_TENANT_ID must be set for azure:// URLs")
+	}
+	if accountKey == "" {
+		return newManagedIdentityStore(args, tenantID, clientID, storageAccount, container, prefix)
 	}
 
 	// arize change to support china cloud
@@ -52,7 +64,6 @@ func NewAccount(ep *url.URL) (stores.Store, error) {
 
 	var pipeline = azblob.NewPipeline(credentials, azblob.PipelineOptions{})
 
-	// Create the new SDK credential for SAS signing
 	sasKey, err := service.NewSharedKeyCredential(storageAccount, accountKey)
 	if err != nil {
 		return nil, err
@@ -76,6 +87,75 @@ func NewAccount(ep *url.URL) (stores.Store, error) {
 		"container":      container,
 		"prefix":         prefix,
 	}).Info("constructed new Azure Shared Key storage client")
+
+	return store, nil
+}
+
+func newManagedIdentityStore(args StoreQueryArgs, tenantID string, clientID string, storageAccount string, container string, prefix string) (stores.Store, error) {
+	// arize change to support china cloud
+	blobDomain := os.Getenv("AZURE_BLOB_DOMAIN")
+	if blobDomain == "" {
+		blobDomain = "blob.core.windows.net"
+	}
+
+	credentials, err := azidentity.NewManagedIdentityCredential(&azidentity.ManagedIdentityCredentialOptions{
+		ID: azidentity.ClientID(clientID),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var refreshFn = func(credential azblob.TokenCredential) time.Duration {
+		if token, err := credentials.GetToken(
+			context.Background(),
+			policy.TokenRequestOptions{
+				TenantID: tenantID,
+				Scopes:   []string{"https://storage.azure.com/.default"}},
+		); err != nil {
+			log.WithFields(log.Fields{
+				"err":    err,
+				"tenant": tenantID,
+			}).Errorf("failed to refresh Azure credential (will retry)")
+
+			return time.Minute
+		} else {
+			credential.SetToken(token.Token)
+			return token.ExpiresOn.Sub(time.Now().Add(time.Minute))
+		}
+	}
+	var accessKey = azblob.NewTokenCredential("", refreshFn)
+
+	client, err := service.NewClient(
+		azureStorageURL(storageAccount, blobDomain),
+		credentials,
+		&service.ClientOptions{},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	var store = &adStore{
+		storeBase: storeBase{
+			storageAccount: storageAccount,
+			blobDomain:     blobDomain,
+			container:      container,
+			prefix:         prefix,
+			args:           args,
+			pipeline:       azblob.NewPipeline(accessKey, azblob.PipelineOptions{}),
+		},
+		tenantID: tenantID,
+		client:   client,
+	}
+
+	log.WithFields(log.Fields{
+		"tenant":         tenantID,
+		"clientID":       clientID,
+		"storageAccount": storageAccount,
+		"blobDomain":     blobDomain,
+		"container":      container,
+		"prefix":         prefix,
+		"auth":           "managed identity",
+	}).Info("constructed new Azure managed identity storage client")
 
 	return store, nil
 }
