@@ -373,11 +373,11 @@ type EnvelopeOrError struct {
 // metadata-only read. If offset > writeHead, it returns writeHead to avoid
 // mid-frame desync after broker spool loss. On error, returns the original
 // offset unchanged (fail-open).
-func clampOffsetToWriteHead(ctx context.Context, jc pb.JournalClient, journal pb.Journal, offset pb.Offset) pb.Offset {
+func clampOffsetToWriteHead(ctx context.Context, jc pb.RoutedJournalClient, journal pb.Journal, offset pb.Offset) pb.Offset {
 	if offset <= 0 {
 		return offset // -1 (latest) or 0 (beginning) are special; skip check.
 	}
-	var stream, err = jc.Read(ctx, &pb.ReadRequest{
+	var stream, err = jc.Read(pb.WithDispatchItemRoute(ctx, jc, journal.String(), false), &pb.ReadRequest{
 		Journal:      journal,
 		Offset:       0,
 		Block:        false,
