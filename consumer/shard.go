@@ -369,6 +369,44 @@ type EnvelopeOrError struct {
 	Error error
 }
 
+// clampOffsetToWriteHead queries the journal's current write head via a
+// metadata-only read. If offset > writeHead, it returns writeHead to avoid
+// mid-frame desync after broker spool loss. On error, returns the original
+// offset unchanged (fail-open).
+func clampOffsetToWriteHead(ctx context.Context, jc pb.JournalClient, journal pb.Journal, offset pb.Offset) pb.Offset {
+	if offset <= 0 {
+		return offset // -1 (latest) or 0 (beginning) are special; skip check.
+	}
+	var stream, err = jc.Read(ctx, &pb.ReadRequest{
+		Journal:      journal,
+		Offset:       0,
+		Block:        false,
+		MetadataOnly: true,
+	})
+	if err != nil {
+		log.WithFields(log.Fields{"journal": journal, "offset": offset, "err": err}).
+			Warn("failed to query journal write head; proceeding with checkpoint offset")
+		return offset
+	}
+	var resp *pb.ReadResponse
+	resp, err = stream.Recv()
+	if err != nil {
+		log.WithFields(log.Fields{"journal": journal, "offset": offset, "err": err}).
+			Warn("failed to read journal write head response; proceeding with checkpoint offset")
+		return offset
+	}
+
+	if offset > resp.WriteHead {
+		log.WithFields(log.Fields{
+			"journal":           journal,
+			"checkpoint_offset": int64(offset),
+			"write_head":        int64(resp.WriteHead),
+		}).Error("checkpoint offset exceeds journal write head; resetting to write head to avoid desync (possible broker spool loss)")
+		return resp.WriteHead
+	}
+	return offset
+}
+
 // startReadingMessages from source journals into the provided channel.
 func startReadingMessages(s *shard, cp pc.Checkpoint, ch chan<- EnvelopeOrError) {
 	for _, src := range s.Spec().Sources {
@@ -379,6 +417,10 @@ func startReadingMessages(s *shard, cp pc.Checkpoint, ch chan<- EnvelopeOrError)
 		if offset < src.MinOffset {
 			offset = src.MinOffset
 		}
+
+		// Upper-bound offset to journal write head to prevent mid-frame desync
+		// after broker spool loss.
+		offset = clampOffsetToWriteHead(s.ctx, s.ajc, src.Journal, offset)
 
 		var it = message.NewReadUncommittedIter(
 			client.NewRetryReader(s.ctx, s.ajc, pb.ReadRequest{
