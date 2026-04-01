@@ -396,6 +396,20 @@ func clampOffsetToWriteHead(ctx context.Context, jc pb.RoutedJournalClient, jour
 		return offset
 	}
 
+	if resp.WriteHead <= 0 {
+		// A write head of 0 (or below) indicates the journal is empty or in an
+		// uninitialized/reset state — likely awaiting an admin running
+		// `gazctl journals reset-head` to restore write offsets from cloud store
+		// fragments. Do not clamp to 0 as that would discard the consumer's
+		// entire read progress.
+		log.WithFields(log.Fields{
+			"journal":           journal,
+			"checkpoint_offset": int64(offset),
+			"write_head":        int64(resp.WriteHead),
+		}).Warn("journal write head is zero or negative; proceeding with checkpoint offset (possible spool loss awaiting reset-head)")
+		return offset
+	}
+
 	if offset > resp.WriteHead {
 		log.WithFields(log.Fields{
 			"journal":           journal,
