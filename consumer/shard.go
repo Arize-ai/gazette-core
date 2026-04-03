@@ -374,6 +374,7 @@ type EnvelopeOrError struct {
 // mid-frame desync after broker spool loss. On error, returns the original
 // offset unchanged (fail-open).
 func clampOffsetToWriteHead(ctx context.Context, jc pb.RoutedJournalClient, journal pb.Journal, offset pb.Offset) pb.Offset {
+	log.WithFields(log.Fields{"journal": journal, "offset": offset}).Info("clamping offset to write head")
 	if offset <= 0 {
 		return offset // -1 (latest) or 0 (beginning) are special; skip check.
 	}
@@ -396,6 +397,7 @@ func clampOffsetToWriteHead(ctx context.Context, jc pb.RoutedJournalClient, jour
 		return offset
 	}
 
+	log.WithFields(log.Fields{"journal": journal, "write_head": resp.WriteHead}).Info("write head")
 	if resp.WriteHead <= 0 {
 		// A write head of 0 (or below) indicates the journal is empty or in an
 		// uninitialized/reset state — likely awaiting an admin running
