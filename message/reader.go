@@ -93,6 +93,19 @@ func (it *ReadUncommittedIter) Next() (Envelope, error) {
 			}).Warn("source journal offset jump")
 			continue
 
+		case client.ErrOffsetExceedsWriteHead:
+			// The read offset is ahead of the journal's write head, indicating
+			// the write head moved backward (e.g., after reset-head). Restart
+			// reading at the write head to maintain message framing alignment.
+			var writeHead = it.rr.WriteHead()
+			log.WithFields(log.Fields{
+				"journal":    it.spec.Name,
+				"readOffset": begin,
+				"writeHead":  writeHead,
+			}).Error("read offset exceeds journal write head; restarting at write head (possible reset-head)")
+			it.rr.Reader.Request.Offset = writeHead
+			continue
+
 		default:
 			return Envelope{}, errors.WithMessagef(err, "framing.Unmarshal(offset %d)", begin)
 		}

@@ -477,6 +477,11 @@ var (
 	// because a span of the Journal has been deleted). The Reader's ReadResponse
 	// should be inspected by the caller, and Read may be invoked again to continue.
 	ErrOffsetJump = errors.New("offset jump")
+	// ErrOffsetExceedsWriteHead is returned by RetryReader when a blocking read's
+	// offset is ahead of the journal's write head. This indicates the write head
+	// moved backward (e.g., after `gazctl journals reset-head`). The consumer
+	// should restart the read at Response.WriteHead to maintain framing alignment.
+	ErrOffsetExceedsWriteHead = errors.New("read offset exceeds journal write head")
 	// ErrSeekRequiresNewReader is returned by Reader.Seek if it is unable to
 	// satisfy the requested Seek. A new Reader should be started instead.
 	ErrSeekRequiresNewReader = errors.New("seek offset requires new Reader")

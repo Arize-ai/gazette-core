@@ -107,6 +107,20 @@ func (fi *Index) Query(ctx context.Context, req *pb.ReadRequest) (*pb.ReadRespon
 			return resp, nil, nil
 		}
 
+		// If the read offset is strictly ahead of the write head, new appends
+		// will not align with the expected message framing at resp.Offset. This
+		// occurs after `gazctl journals reset-head` moves the write head backward.
+		// Return OFFSET_NOT_YET_AVAILABLE so the client can detect the mismatch
+		// and restart at the current write head.
+		if fi.set.EndOffset() > 0 && resp.Offset > fi.set.EndOffset() {
+			resp.Status = pb.Status_OFFSET_NOT_YET_AVAILABLE
+			resp.WriteHead = fi.set.EndOffset()
+
+			addTrace(ctx, "Index.Query(%s) => %s (read offset %d exceeds write head %d)",
+				req, resp, resp.Offset, fi.set.EndOffset())
+			return resp, nil, nil
+		}
+
 		addTrace(ctx, " ... stalled in Index.Query(%s)", req)
 
 		// Wait for |condCh| to signal, or for the request |ctx| or Index
