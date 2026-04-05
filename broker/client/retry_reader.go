@@ -100,7 +100,10 @@ func (rr *RetryReader) Read(p []byte) (n int, err error) {
 				// indicates the write head moved backward (e.g., after
 				// reset-head). Surface to the consumer so it can restart
 				// at the write head to maintain framing alignment.
-				err = ErrOffsetExceedsWriteHead
+				err = &OffsetExceedsWriteHeadError{
+					Journal:   rr.Reader.Request.Journal,
+					WriteHead: rr.Reader.Response.WriteHead,
+				}
 				return
 			}
 			if rr.Reader.Request.Block {

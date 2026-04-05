@@ -2,6 +2,7 @@ package consumer
 
 import (
 	"context"
+	stderrors "errors"
 	"runtime/pprof"
 	"sync"
 	"time"
@@ -286,6 +287,32 @@ func servePrimary(s *shard) (err error) {
 		)
 
 		if err = runTransactions(s, cp, msgCh, hintsCh); err != nil {
+			var offsetErr *client.OffsetExceedsWriteHeadError
+			if stderrors.As(err, &offsetErr) {
+				// Write head moved backward (e.g., after reset-head). Restore the
+				// last committed checkpoint, override the affected journal's
+				// ReadThrough to the write head, and commit it so the adjusted
+				// offset survives any future crash.
+				cp, err = s.store.RestoreCheckpoint(s)
+				if err != nil {
+					return errors.WithMessage(err, "RestoreCheckpoint after write head regression")
+				}
+				if src, ok := cp.Sources[offsetErr.Journal]; ok {
+					src.ReadThrough = offsetErr.WriteHead
+					cp.Sources[offsetErr.Journal] = src
+				}
+				var barrier = s.store.StartCommit(s, cp, nil)
+				<-barrier.Done()
+				if err = barrier.Err(); err != nil {
+					return errors.WithMessage(err, "committing adjusted checkpoint after write head regression")
+				}
+				log.WithFields(log.Fields{
+					"shard":     s.Spec().Id,
+					"journal":   offsetErr.Journal,
+					"writeHead": offsetErr.WriteHead,
+				}).Warn("persisted adjusted checkpoint after journal write head regression")
+				continue // Restart the transaction loop with corrected checkpoint.
+			}
 			return errors.WithMessage(err, "runTransactions")
 		}
 

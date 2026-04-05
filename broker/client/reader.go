@@ -477,10 +477,8 @@ var (
 	// because a span of the Journal has been deleted). The Reader's ReadResponse
 	// should be inspected by the caller, and Read may be invoked again to continue.
 	ErrOffsetJump = errors.New("offset jump")
-	// ErrOffsetExceedsWriteHead is returned by RetryReader when a blocking read's
-	// offset is ahead of the journal's write head. This indicates the write head
-	// moved backward (e.g., after `gazctl journals reset-head`). The consumer
-	// should restart the read at Response.WriteHead to maintain framing alignment.
+	// ErrOffsetExceedsWriteHead is a sentinel for errors.Is matching against
+	// *OffsetExceedsWriteHeadError, which carries the journal and write head.
 	ErrOffsetExceedsWriteHead = errors.New("read offset exceeds journal write head")
 	// ErrSeekRequiresNewReader is returned by Reader.Seek if it is unable to
 	// satisfy the requested Seek. A new Reader should be started instead.
@@ -492,3 +490,20 @@ var (
 	// httpClient is the http.Client used by OpenFragmentURL
 	httpClient = newHttpClient()
 )
+
+// OffsetExceedsWriteHeadError is returned by RetryReader when a read's offset
+// is ahead of the journal's write head, indicating the write head moved backward
+// (e.g., after `gazctl journals reset-head`). It carries the journal name and
+// current write head so the consumer can persist the adjusted offset.
+type OffsetExceedsWriteHeadError struct {
+	Journal   pb.Journal
+	WriteHead int64
+}
+
+func (e *OffsetExceedsWriteHeadError) Error() string {
+	return fmt.Sprintf("read offset exceeds journal write head (%s at %d)", e.Journal, e.WriteHead)
+}
+
+func (e *OffsetExceedsWriteHeadError) Is(target error) bool {
+	return target == ErrOffsetExceedsWriteHead
+}
