@@ -40,7 +40,7 @@ func (fs FragmentStore) URL() *url.URL {
 }
 
 func (fs FragmentStore) parse() (*url.URL, error) {
-	var url, err = url.Parse(string(fs))
+	var url, err = parseFragmentStoreURL(string(fs))
 	if err != nil {
 		return nil, &ValidationError{Err: err}
 	} else if !url.IsAbs() {
@@ -73,6 +73,58 @@ func (fs FragmentStore) parse() (*url.URL, error) {
 		return nil, NewValidationError("path component doesn't end in '/' (%s)", url.Path)
 	}
 	return url, nil
+}
+
+// parseFragmentStoreURL parses a fragment store URL. It transparently handles
+// S3 Access Point and Multi-Region Access Point (MRAP) bucket ARNs used as the
+// "bucket". An ARN such as
+//
+//	arn:aws:s3::123456789012:accesspoint/my-alias.mrap
+//
+// embeds colons (which net/url misreads as a host:port) and a slash (which it
+// misreads as the start of the path), so a bare url.Parse rejects it with
+// "invalid port" errors. We instead split the bucket ARN from the object key
+// prefix at the slash following the access-point / MRAP name, and assemble the
+// url.URL directly. The remainder is the object key prefix, exactly as a
+// conventional s3://bucket/prefix/ URL.
+func parseFragmentStoreURL(raw string) (*url.URL, error) {
+	const s3ARNPrefix = "s3://arn:"
+	const apMarker = ":accesspoint/"
+
+	if !strings.HasPrefix(raw, s3ARNPrefix) {
+		return url.Parse(raw)
+	}
+
+	// Separate the query string, if present.
+	var rest = raw[len("s3://"):]
+	var rawQuery string
+	if i := strings.IndexByte(rest, '?'); i != -1 {
+		rest, rawQuery = rest[:i], rest[i+1:]
+	}
+
+	// The bucket ARN ends with the access-point / MRAP name that immediately
+	// follows ":accesspoint/". The next '/' (or end of string) begins the
+	// object key prefix.
+	var ap = strings.Index(rest, apMarker)
+	if ap == -1 {
+		return url.Parse(raw) // Not an access-point ARN; let net/url report.
+	}
+
+	var nameStart = ap + len(apMarker)
+	var bucket, path string
+	if slash := strings.IndexByte(rest[nameStart:], '/'); slash == -1 {
+		bucket, path = rest, ""
+	} else {
+		var boundary = nameStart + slash
+		bucket, path = rest[:boundary], rest[boundary:]
+	}
+
+	return &url.URL{
+		Scheme:   "s3",
+		Host:     bucket,
+		Path:     path,
+		RawQuery: rawQuery,
+	}, nil
 }
 
 func fragmentStoresEq(a, b []FragmentStore) bool {
