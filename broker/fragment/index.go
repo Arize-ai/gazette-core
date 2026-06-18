@@ -107,12 +107,33 @@ func (fi *Index) Query(ctx context.Context, req *pb.ReadRequest) (*pb.ReadRespon
 			return resp, nil, nil
 		}
 
+		// Determine whether an initial remote refresh has completed. Before the
+		// first refresh the index may transiently be empty (or lag the true
+		// persisted extent), so resp.Offset > EndOffset() does not yet imply a
+		// write head regression.
+		var refreshed bool
+		select {
+		case <-fi.firstRefreshCh:
+			refreshed = true
+		default:
+		}
+
 		// If the read offset is strictly ahead of the write head, new appends
 		// will not align with the expected message framing at resp.Offset. This
 		// occurs after `gazctl journals reset-head` moves the write head backward.
 		// Return OFFSET_NOT_YET_AVAILABLE so the client can detect the mismatch
 		// and restart at the current write head.
-		if fi.set.EndOffset() > 0 && resp.Offset > fi.set.EndOffset() {
+		//
+		// We gate on the first remote refresh (rather than EndOffset() > 0) so
+		// the case is also detected when the write head is zero, e.g. after a
+		// reset of a journal whose fragments were all lost. After the first
+		// refresh EndOffset() reflects the journal's true extent, so a zero
+		// EndOffset() genuinely means the head is at zero. The tradeoff is a
+		// transient false positive during failover of a journal with no
+		// persisted fragments and a live spool still re-establishing past
+		// resp.Offset: the consumer restarts at the (zero) write head and
+		// reprocesses, which is correctness-preserving (see reset-shard.md).
+		if refreshed && resp.Offset > fi.set.EndOffset() {
 			resp.Status = pb.Status_OFFSET_NOT_YET_AVAILABLE
 			resp.WriteHead = fi.set.EndOffset()
 

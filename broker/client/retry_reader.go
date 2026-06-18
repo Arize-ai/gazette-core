@@ -94,12 +94,14 @@ func (rr *RetryReader) Read(p []byte) (n int, err error) {
 		case context.DeadlineExceeded, context.Canceled:
 			return // Surface to caller.
 		case ErrOffsetNotYetAvailable:
-			if rr.Reader.Response.WriteHead > 0 &&
-				rr.Reader.Request.Offset > rr.Reader.Response.WriteHead {
+			if rr.Reader.Request.Offset > rr.Reader.Response.WriteHead {
 				// Read offset is ahead of the journal's write head. This
 				// indicates the write head moved backward (e.g., after
-				// reset-head). Surface to the consumer so it can restart
-				// at the write head to maintain framing alignment.
+				// reset-head). We do not require WriteHead > 0 so that a reset
+				// to a zero write head (a journal whose fragments were all lost)
+				// is also surfaced rather than retried endlessly. Surface to the
+				// consumer so it can restart at the write head to maintain
+				// framing alignment.
 				err = &OffsetExceedsWriteHeadError{
 					Journal:   rr.Reader.Request.Journal,
 					WriteHead: rr.Reader.Response.WriteHead,

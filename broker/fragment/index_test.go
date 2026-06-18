@@ -97,6 +97,58 @@ func TestQueryAtHead(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestQueryOffsetExceedsZeroWriteHead(t *testing.T) {
+	var ind = NewIndex(context.Background())
+
+	// Complete a first remote refresh with no fragments: the write head is zero
+	// (e.g. a journal whose fragments were all lost and then reset).
+	ind.ReplaceRemote(CoverSet{})
+
+	// A blocking read ahead of the (zero) write head must not block waiting for
+	// misaligned appends; it returns OFFSET_NOT_YET_AVAILABLE with WriteHead 0 so
+	// the client can restart at the write head.
+	var resp, file, err = ind.Query(context.Background(), &pb.ReadRequest{Offset: 100, Block: true})
+	require.Equal(t, &pb.ReadResponse{
+		Status:    pb.Status_OFFSET_NOT_YET_AVAILABLE,
+		Offset:    100,
+		WriteHead: 0,
+	}, resp)
+	require.Nil(t, file)
+	require.NoError(t, err)
+}
+
+func TestQueryAheadOfUnrefreshedIndexBlocks(t *testing.T) {
+	var ind = NewIndex(context.Background())
+
+	// Local content exists, but a first remote refresh has NOT completed, so the
+	// index may still lag the journal's true persisted extent. A read ahead of
+	// the current EndOffset() must block rather than falsely report a regressed
+	// write head.
+	ind.SpoolCommit(buildSet(t, 0, 50)[0])
+
+	var ch = make(chan *pb.ReadResponse, 1)
+	go func() {
+		var resp, _, _ = ind.Query(context.Background(), &pb.ReadRequest{Offset: 100, Block: true})
+		ch <- resp
+	}()
+
+	select {
+	case <-ch:
+		t.Fatal("Query returned before the first remote refresh")
+	case <-time.After(50 * time.Millisecond):
+		// Still blocked, as expected.
+	}
+
+	// Completing the first refresh allows the detector to fire.
+	ind.ReplaceRemote(buildSet(t, 0, 50))
+
+	require.Equal(t, &pb.ReadResponse{
+		Status:    pb.Status_OFFSET_NOT_YET_AVAILABLE,
+		Offset:    100,
+		WriteHead: 50,
+	}, <-ch)
+}
+
 func TestQueryAtMissingByteZero(t *testing.T) {
 	var ind = NewIndex(context.Background())
 	var now = time.Now().Unix()
