@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	log "github.com/sirupsen/logrus"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.gazette.dev/core/allocator"
@@ -37,6 +39,11 @@ const (
 	// before the message sequencer will prune the older producer state.
 	messageSequencerPruneHorizon = time.Hour * 24
 )
+
+var writeHeadResets = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "gazette_writehead_resets_total",
+	Help: "Times a consumer offset was clamped to journal write head after suspected broker spool loss",
+})
 
 type shard struct {
 	svc          *Service                  // Service which owns the shard.
@@ -445,6 +452,7 @@ func clampOffsetToWriteHead(ctx context.Context, jc pb.RoutedJournalClient, jour
 			"checkpoint_offset": int64(offset),
 			"write_head":        int64(resp.WriteHead),
 		}).Error("checkpoint offset exceeds journal write head; resetting to write head to avoid desync (possible broker spool loss)")
+		writeHeadResets.Inc()
 		return resp.WriteHead
 	}
 	return offset
