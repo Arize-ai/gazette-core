@@ -6,7 +6,7 @@ FROM cgr.dev/arize.com/custom-gazette-base:latest AS broker
 ARG TARGETARCH
 
 USER root
-RUN apk add --no-cache curl
+RUN apk add --no-cache bash curl
 
 COPY ${TARGETARCH}/gazette ${TARGETARCH}/gazctl /usr/local/bin
 
