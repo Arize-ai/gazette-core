@@ -1,21 +1,17 @@
 ################################################################################
 # Gazette broker image.
 
-FROM ubuntu:24.04 AS broker
+FROM cgr.dev/arize.com/custom-gazette-base:latest AS broker
 
 ARG TARGETARCH
 
-RUN apt-get update -y \
- && apt-get upgrade -y \
- && apt-get install --no-install-recommends -y \
-      ca-certificates \
-      curl \
- && rm -rf /var/lib/apt/lists/*
+USER root
+RUN apk add --no-cache curl
 
-COPY ${TARGETARCH}/gazette ${TARGETARCH}/gazctl /usr/local/bin 
+COPY ${TARGETARCH}/gazette ${TARGETARCH}/gazctl /usr/local/bin
 
 # Run as non-privileged "gazette" user.
-RUN useradd gazette --create-home --shell /usr/sbin/nologin
+RUN adduser -D -h /home/gazette -s /sbin/nologin gazette
 USER gazette
 WORKDIR /home/gazette
 

@@ -51,6 +51,20 @@ jobs:
       - run: make go-test-ci
       - run: make go-build
 
+      - name: Configure cgr.dev pull auth
+        run: |
+          mkdir -p ~/.docker
+          CGR_AUTH=$(gcloud secrets versions access latest \
+            --secret=chainguard-docker-pull \
+            --project=ci-it-319801 | tr -d '\n\r')
+          if [ -f ~/.docker/config.json ]; then
+            jq --arg token "$CGR_AUTH" '.auths["cgr.dev"] = {"auth": $token}' \
+              ~/.docker/config.json > ~/.docker/config.tmp
+            mv ~/.docker/config.tmp ~/.docker/config.json
+          else
+            printf '{"auths":{"cgr.dev":{"auth":"%s"}}}\n' "$CGR_AUTH" > ~/.docker/config.json
+          fi
+
       - run: gcloud auth configure-docker ${{ secrets.REGISTRY }}
       - uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
