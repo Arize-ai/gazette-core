@@ -5,9 +5,6 @@ FROM cgr.dev/arize.com/custom-gazette-base:latest AS broker
 
 ARG TARGETARCH
 
-USER root
-RUN apk add --no-cache bash curl
-
 COPY ${TARGETARCH}/gazette ${TARGETARCH}/gazctl /usr/local/bin
 
 # Run as non-privileged "gazette" user.
