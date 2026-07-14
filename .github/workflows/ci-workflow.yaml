@@ -66,6 +66,8 @@ jobs:
           fi
 
       - run: gcloud auth configure-docker ${{ secrets.REGISTRY }}
+
+      # SaaS: Ubuntu-based broker
       - uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           context: .build
@@ -75,4 +77,16 @@ jobs:
           provenance: false
           sbom: false
           tags: "${{ secrets.REGISTRY_PATH }}/gazette/broker:${{ env.VERSION }}"
+          push: true
+
+      # On-prem: Chainguard-based broker
+      - uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+        with:
+          context: .build
+          file: Dockerfile
+          target: broker-onprem
+          platforms: linux/amd64
+          provenance: false
+          sbom: false
+          tags: "${{ secrets.REGISTRY_PATH }}/gazette/broker-onprem:${{ env.VERSION }}"
           push: true
