@@ -288,8 +288,9 @@ func logAssignmentDiff(current keyspace.KeyValues, desired []Assignment) {
 	}
 }
 
-// logGroupBalance logs a per-group summary of how evenly `desired` spreads
-// each multi-Item group's Assignments across Members, and warns if any
+// logGroupBalance logs, at Info level (so it's visible without enabling
+// Debug logging), a per-group summary of how evenly `desired` spreads each
+// multi-Item group's Assignments across Members. It warns instead if any
 // group's spread (its most- minus least-assigned Member) exceeds what a
 // perfectly even split would require. A wider spread is not necessarily a
 // bug -- the flow network relaxes its per-group fair-share cap rather than
@@ -321,7 +322,7 @@ func logGroupBalance(desired []Assignment) {
 		if max-min > 1 {
 			log.WithFields(fields).Warn("group balance wider than expected")
 		} else {
-			log.WithFields(fields).Debug("group balance")
+			log.WithFields(fields).Info("group balance")
 		}
 	}
 }
