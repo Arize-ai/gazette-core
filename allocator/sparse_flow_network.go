@@ -362,15 +362,25 @@ func (fs *sparseFlowNetwork) Nodes() int {
 }
 
 func (fs *sparseFlowNetwork) InitialHeight(id pr.NodeID) pr.Height {
+	var h pr.Height
 	if id < fs.firstZoneItemNodeID {
-		return 4 // Item node.
+		h = 4 // Item node.
 	} else if id < fs.firstGroupMemberNodeID {
-		return 3 // Zone-Item node.
+		h = 3 // Zone-Item node.
 	} else if id < fs.firstMemberNodeID {
-		return 2 // Group-Member node.
+		h = 2 // Group-Member node.
 	} else {
-		return 1 // Member node.
+		h = 1 // Member node.
 	}
+	// heightCounts is sized to Nodes(), so every returned height must stay
+	// within [0, Nodes()-1]. The four-tier scheme above assumes enough nodes
+	// exist to justify height 4, which can be untrue for tiny networks (e.g.
+	// items with zero current members). Clamping is safe: InitialHeight is
+	// only a distance-to-sink heuristic, not a correctness requirement.
+	if max := pr.Height(fs.Nodes() - 1); h > max {
+		h = max
+	}
+	return h
 }
 
 func (fs *sparseFlowNetwork) Arcs(mf *pr.MaxFlow, id pr.NodeID, page pr.PageToken) ([]pr.Arc, pr.PageToken) {

@@ -409,6 +409,30 @@ func (s *SparseSuite) TestGroupMemberFairShare(c *gc.C) {
 	c.Check(byMember, gc.DeepEquals, map[string]int{"one": 2, "two": 2})
 }
 
+// TestInitialHeightClampedForTinyNetworks is a regression test for a panic
+// ("index out of range" in sparse_push_relabel.newMaxFlow) observed when
+// Items exist but the network has too few Members to justify the full
+// four-tier height scheme (Item, Zone-Item, Group-Member, Member). Nodes()
+// can then be smaller than the raw Item height of 4, which must be clamped.
+func (s *SparseSuite) TestInitialHeightClampedForTinyNetworks(c *gc.C) {
+	var client, ctx = etcdtest.TestClient(), context.Background()
+	defer etcdtest.Cleanup()
+
+	var _, err = client.Put(ctx, "/root/items/lone-item", `{"R": 1}`)
+	c.Assert(err, gc.IsNil)
+
+	var ks = NewAllocatorKeySpace("/root", testAllocDecoder{})
+	var state = NewObservedState(ks, MemberKey(ks, "zone-a", "member-A1"), isConsistent)
+	c.Check(ks.Load(ctx, client, 0), gc.IsNil)
+
+	var fn = newSparseFlowNetwork(state, state.Items)
+	for id := pr.SinkID + 1; id != pr.NodeID(fn.Nodes()); id++ {
+		c.Check(fn.InitialHeight(id) < pr.Height(fn.Nodes()), gc.Equals, true)
+	}
+	// Must not panic despite there being no Members to assign to.
+	_ = pr.FindMaxFlow(fn)
+}
+
 func (s *SparseSuite) TestItemGroup(c *gc.C) {
 	c.Check(itemGroup("a-topic/part-003"), gc.Equals, "a-topic")
 	c.Check(itemGroup("a-topic/part=012"), gc.Equals, "a-topic")
