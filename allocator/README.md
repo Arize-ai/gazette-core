@@ -86,8 +86,18 @@ between Zone-Item and Member nodes. Every Zone-Item of that group, within
 that zone, is routed through the Group-Member node of its target Member
 rather than directly to the Member. The Group-Member's single outgoing arc
 is capacity-bound to that Member's fair share of the group within the zone
-(`ceil(groupSize / zoneMemberCount)`), enforcing balance as a hard flow
+(`ceil(groupDemand / zoneMemberCount)`), enforcing balance as a hard flow
 constraint rather than a mere ordering preference. Exactly like Member
 fair-share (`buildMemberArc`), this cap is relaxed under sufficient network
 "pressure" (see `groupMemberOverflowThreshold`) so that group fairness never
 prevents an otherwise-achievable maximum assignment.
+
+`groupDemand` is the group's Item *count* in the common multi-zone case,
+since each Item ordinarily places just one replica per zone. But with only a
+single zone, every replica of every Item -- not just one -- must land there,
+so `groupDemand` is instead the group's total replication slots (`Item count
+* DesiredReplication`). Using the raw Item count unconditionally understates
+demand for `R > 1` in a single-zone cluster, which sets the cap far too low;
+it's relaxed under pressure almost immediately, and because that relaxation
+kicks in per-Group-Member rather than uniformly, one arbitrary Member ends up
+absorbing the bulk of the group instead of the load spreading evenly.

@@ -95,9 +95,13 @@ type sparseFlowNetwork struct {
 	// Zone-Item connects directly to Members exactly as if grouping did not
 	// exist at all.
 	groupIndex map[string]int
-	// groupItemCounts[gi] is the count of Items within myItems belonging to
-	// the group having dense index gi. Used to compute each Member's fair
-	// share of the group's Items within a zone.
+	// groupItemCounts[gi] is the demand -- in Zone-Item slots -- that the
+	// group having dense index gi places on a single zone, used to compute
+	// each Member's fair share of the group's Items within that zone. It's
+	// the group's raw Item count in the common multi-zone case (each Item
+	// ordinarily places one replica per zone), but its total replication
+	// slots (Item count * DesiredReplication) when there's only a single
+	// zone, since then every replica of every Item must land within it.
 	groupItemCounts []int
 	// zoneMemberCount[zone] is the count of Members within that zone.
 	zoneMemberCount []int
@@ -216,12 +220,15 @@ func newSparseFlowNetwork(s *State, myItems keyspace.KeyValues) *sparseFlowNetwo
 	var myItemSlots int
 
 	// Determine each Item's logical group (see itemGroup), and count how
-	// many Items of myItems fall into each. Groups with fewer than two Items
-	// are dropped: with a single Item, there's nothing to unfairly cluster
-	// within a zone.
+	// many Items of myItems -- and how many total replication slots -- fall
+	// into each. Groups with fewer than two Items are dropped: with a single
+	// Item, there's nothing to unfairly cluster within a zone.
 	var rawGroupCounts = make(map[string]int)
+	var rawGroupSlots = make(map[string]int)
 	for item := range myItems {
-		rawGroupCounts[itemGroup(itemAt(myItems, item).ID)]++
+		var group = itemGroup(itemAt(myItems, item).ID)
+		rawGroupCounts[group]++
+		rawGroupSlots[group] += itemAt(myItems, item).DesiredReplication()
 	}
 	var groupNames []string
 	for group, n := range rawGroupCounts {
@@ -235,7 +242,11 @@ func newSparseFlowNetwork(s *State, myItems keyspace.KeyValues) *sparseFlowNetwo
 	var groupItemCounts = make([]int, len(groupNames))
 	for gi, group := range groupNames {
 		groupIndex[group] = gi
-		groupItemCounts[gi] = rawGroupCounts[group]
+		if len(s.Zones) == 1 {
+			groupItemCounts[gi] = rawGroupSlots[group]
+		} else {
+			groupItemCounts[gi] = rawGroupCounts[group]
+		}
 	}
 	var numGroups = len(groupNames)
 

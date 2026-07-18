@@ -982,6 +982,32 @@ func TestPartitionedItemsBalanceAcrossMembers(t *testing.T) {
 	}, groupCountsByMember(ks, "a-topic"))
 }
 
+// TestPartitionedItemsBalanceWithReplication is a regression test for a bug
+// where the group fair-share cap counted each grouped Item once regardless
+// of its replication factor R. Within a single zone, every replica of every
+// Item must land in that zone, so the cap must scale by R -- otherwise it's
+// set far too low, is immediately relaxed under network pressure, and one
+// arbitrary Member ends up absorbing most of the group instead of the load
+// spreading evenly.
+func TestPartitionedItemsBalanceWithReplication(t *testing.T) {
+	var ctx, client, ks = testSetup(t)
+
+	var kv []string
+	for i := 0; i != 8; i++ {
+		kv = append(kv, itemKey("a-topic/part-%02d", i), `{"R": 2}`)
+	}
+	for _, suffix := range []string{"A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8"} {
+		kv = append(kv, "/root/members/zone-a#member-"+suffix, `{"R": 100}`)
+	}
+	require.NoError(t, insert(ctx, client, kv...))
+	serveUntilIdle(t, ctx, client, ks, "")
+
+	require.Equal(t, map[string]int{
+		"member-A1": 2, "member-A2": 2, "member-A3": 2, "member-A4": 2,
+		"member-A5": 2, "member-A6": 2, "member-A7": 2, "member-A8": 2,
+	}, groupCountsByMember(ks, "a-topic"))
+}
+
 // TestPartitionedItemsBalanceAcrossMembersWithUnrelatedLoad checks that
 // group balance holds even atop a cluster already carrying substantial,
 // unrelated (unevenly-distributed) load from other, singleton-group Items.
