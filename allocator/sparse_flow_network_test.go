@@ -2,6 +2,7 @@ package allocator
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -12,6 +13,48 @@ import (
 )
 
 type SparseSuite struct{}
+
+// TestRotatedZoneItemArcsCyclesAllMembers is a regression test for
+// rotatedZoneItemArcs's pre-rotation, isolated from the emergent behavior of
+// the full push/relabel solver (which can otherwise mask a regression here
+// through its own, unrelated re-balancing heuristics -- see the "arize-edge"
+// investigation this guards against).
+//
+// It uses two Zones of four Members each. len(Zones) == 2 shares a common
+// factor of 2 with the 4 zone Members, so the push/relabel solver's own
+// nid-based Arc shift (see discharge()) alone would only ever reach 2 of
+// the 4 Members as a "first preference" across consecutive Items, absent
+// rotatedZoneItemArcs's compensating pre-rotation.
+func TestRotatedZoneItemArcsCyclesAllMembers(t *testing.T) {
+	var ctx, client, ks = testSetup(t)
+
+	var kv []string
+	for _, zone := range []string{"zone-a", "zone-b"} {
+		for _, suffix := range []string{"1", "2", "3", "4"} {
+			kv = append(kv, "/root/members/"+zone+"#member-"+suffix, `{"R": 100}`)
+		}
+	}
+	for i := 0; i != 8; i++ {
+		kv = append(kv, fmt.Sprintf("/root/items/a-topic/part-%02d", i), `{"R": 2}`)
+	}
+	require.NoError(t, insert(ctx, client, kv...))
+
+	var state = NewObservedState(ks, "/root/members/zone-a#member-1", isConsistent)
+	require.NoError(t, ks.Load(ctx, client, 0))
+
+	var fn = newSparseFlowNetwork(state, state.Items)
+
+	var firstChoices = make(map[pr.NodeID]bool)
+	for item := 0; item != 8; item++ {
+		var zoneItem = item*len(fn.Zones) + 0 // zone-a is index 0.
+		var nid = fn.firstZoneItemNodeID + pr.NodeID(zoneItem)
+		var arcs = fn.rotatedZoneItemArcs(0, item, nid)
+		require.NotEmpty(t, arcs)
+		firstChoices[arcs[0].To] = true
+	}
+	require.Len(t, firstChoices, 4,
+		"expected all 4 Members of the zone to be reachable as a first preference")
+}
 
 func TestItemGroup(t *testing.T) {
 	require.Equal(t, "a-topic", itemGroup("a-topic/part-003"))

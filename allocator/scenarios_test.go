@@ -119,6 +119,43 @@ func TestPartitionedItemsBalanceAcrossMembers(t *testing.T) {
 	}, counts)
 }
 
+// TestPartitionedItemsBalanceAcrossZonedMembers is a variant of
+// TestPartitionedItemsBalanceAcrossMembers using two zones of four Members
+// each, verifying group balance end-to-end through the full solver when
+// Items are replicated across multiple zones. (The zone/Member counts here
+// are chosen to also be the pathological case for rotatedZoneItemArcs's
+// pre-rotation -- see TestRotatedZoneItemArcsCyclesAllMembers for a test
+// which isolates that specific mechanism; the full solver used here has
+// enough other self-balancing behavior that it doesn't, on its own, catch a
+// regression there.)
+func TestPartitionedItemsBalanceAcrossZonedMembers(t *testing.T) {
+	var ctx, client, ks = testSetup(t)
+
+	var kv []string
+	for _, zone := range []string{"zone-a", "zone-b"} {
+		for _, suffix := range []string{"1", "2", "3", "4"} {
+			kv = append(kv, "/root/members/"+zone+"#member-"+suffix, `{"R": 100}`)
+		}
+	}
+	for i := 0; i != 16; i++ {
+		kv = append(kv, fmt.Sprintf("/root/items/a-topic/part-%02d", i), `{"R": 2}`)
+	}
+	require.NoError(t, insert(ctx, client, kv...))
+	serveUntilIdle(t, ctx, client, ks, "")
+
+	// Expect each of the 4 Members of each zone is assigned exactly four of
+	// the 16 Items (each Item is replicated once into each zone).
+	var counts = make(map[string]int)
+	for _, kv := range ks.Prefixed(ks.Root + AssignmentsPrefix) {
+		var a = kv.Decoded.(Assignment)
+		counts[a.MemberZone+"#"+a.MemberSuffix]++
+	}
+	require.Equal(t, map[string]int{
+		"zone-a#member-1": 4, "zone-a#member-2": 4, "zone-a#member-3": 4, "zone-a#member-4": 4,
+		"zone-b#member-1": 4, "zone-b#member-2": 4, "zone-b#member-3": 4, "zone-b#member-4": 4,
+	}, counts)
+}
+
 // TestPartitionedItemsBalanceAcrossMembersWithUnrelatedLoad extends
 // TestPartitionedItemsBalanceAcrossMembers by also placing substantial
 // unrelated ("noise") load onto the same Members before the grouped Items
