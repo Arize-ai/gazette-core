@@ -103,8 +103,11 @@ func (s *SparseSuite) TestOverKeySpaceFixture(c *gc.C) {
 	verifyArcs(c, fn, mf, I2E, [][]pr.Arc{
 		{{To: MBar, Capacity: 1, PushFront: true}},
 		{
-			{To: MBar, Capacity: 1},
+			// Rotated relative to I1E's identical Arc list (both are the
+			// "us-east" Zone-Item of an Item), so that "item-1" and
+			// "item-two" don't uniformly prefer the same Member first.
 			{To: MFoo, Capacity: 1},
+			{To: MBar, Capacity: 1},
 		},
 	})
 	verifyArcs(c, fn, mf, I1W, [][]pr.Arc{
