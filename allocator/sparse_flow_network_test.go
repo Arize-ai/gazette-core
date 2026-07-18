@@ -2,7 +2,9 @@ package allocator
 
 import (
 	"context"
+	"testing"
 
+	"github.com/stretchr/testify/require"
 	pr "go.gazette.dev/core/allocator/sparse_push_relabel"
 	"go.gazette.dev/core/etcdtest"
 	"go.gazette.dev/core/keyspace"
@@ -10,6 +12,18 @@ import (
 )
 
 type SparseSuite struct{}
+
+func TestItemGroup(t *testing.T) {
+	require.Equal(t, "a-topic", itemGroup("a-topic/part-003"))
+	require.Equal(t, "a-topic", itemGroup("a-topic/part=003"))
+	require.Equal(t, "a/nested/topic", itemGroup("a/nested/topic/007"))
+
+	// No trailing digits on the final path segment: not a recognized
+	// partition suffix, so the Item is its own (singleton) group.
+	require.Equal(t, "some-app/journal-a", itemGroup("some-app/journal-a"))
+	require.Equal(t, "no-slash", itemGroup("no-slash"))
+	require.Equal(t, "a-topic/part-", itemGroup("a-topic/part-")) // Empty tail: no digits to strip.
+}
 
 func (s *SparseSuite) TestOverKeySpaceFixture(c *gc.C) {
 	var client, ctx = etcdtest.TestClient(), context.Background()

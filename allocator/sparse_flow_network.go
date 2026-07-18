@@ -84,6 +84,13 @@ type sparseFlowNetwork struct {
 	// the largest of allZoneItemArcsByZone, to avoid a heap allocation on
 	// each call.
 	rotationScratch []pr.Arc
+	// groupMemberCounts maps an Item group (see itemGroup) to a count, indexed
+	// by a Member's position within State.Members, of that group's current
+	// Assignments to the Member. It's used to prefer Members currently
+	// holding fewer Assignments of an Item's group, so that Items sharing a
+	// common group (eg, partitions of a logical journal) balance evenly
+	// across Members independent of the Cluster's total (all-groups) load.
+	groupMemberCounts map[string][]int32
 }
 
 const (
@@ -215,8 +222,65 @@ func newSparseFlowNetwork(s *State, myItems keyspace.KeyValues) *sparseFlowNetwo
 		memberSuffixIdxByZone: memberSuffixIdxByZone,
 		allZoneItemArcsByZone: allZoneItemArcsByZone,
 		rotationScratch:       make([]pr.Arc, maxZoneMembers),
+		groupMemberCounts:     buildGroupMemberCounts(s),
 	}
 	return fs
+}
+
+// buildGroupMemberCounts computes, in a single pass over State.Assignments,
+// a per-group histogram of current Assignments to each Member. See
+// sparseFlowNetwork.groupMemberCounts and itemGroup.
+func buildGroupMemberCounts(s *State) map[string][]int32 {
+	// Index Members by (zone, suffix) to their position within s.Members,
+	// so we can accumulate counts with a single linear pass of Assignments
+	// (which are ordered on ItemID first, not Member).
+	var memberIdx = make(map[string]int, len(s.Members))
+	for m := range s.Members {
+		var mv = memberAt(s.Members, m)
+		memberIdx[mv.Zone+"\x00"+mv.Suffix] = m
+	}
+
+	var counts = make(map[string][]int32)
+	for _, kv := range s.Assignments {
+		var a = kv.Decoded.(Assignment)
+		var m, ok = memberIdx[a.MemberZone+"\x00"+a.MemberSuffix]
+		if !ok {
+			continue // Assignment references a since-removed Member.
+		}
+		var g = itemGroup(a.ItemID)
+		var c = counts[g]
+		if c == nil {
+			c = make([]int32, len(s.Members))
+			counts[g] = c
+		}
+		c[m]++
+	}
+	return counts
+}
+
+// itemGroup returns the logical group of an Item ID, used to balance Items
+// which are partitions of the same logical journal or shard evenly across
+// Members. Item IDs are conventionally hierarchical paths whose final
+// segment identifies a partition (eg, "a-topic/part-003" -- see the Journal
+// doc comment in broker/protocol). If the final path segment ends in a run
+// of digits, we treat it as a partition suffix and the group is everything
+// before it; otherwise -- since we can't distinguish a deliberate grouping
+// from two unrelated Items which merely share a path prefix -- the Item is
+// treated as its own (singleton) group, matching prior (ungrouped) behavior.
+func itemGroup(id string) string {
+	var slash = strings.LastIndexByte(id, '/')
+	if slash < 0 {
+		return id
+	}
+	var tail = id[slash+1:]
+	var i = len(tail)
+	for i > 0 && tail[i-1] >= '0' && tail[i-1] <= '9' {
+		i--
+	}
+	if i == len(tail) {
+		return id // Final segment has no trailing digits: not a partition suffix.
+	}
+	return id[:slash]
 }
 
 func (fs *sparseFlowNetwork) Nodes() int {
@@ -282,7 +346,7 @@ func (fs *sparseFlowNetwork) Arcs(mf *pr.MaxFlow, id pr.NodeID, page pr.PageToke
 		case pr.PageInitial:
 			return fs.buildCurrentZoneItemArcs(zoneItem), pageZoneItemAllMembers
 		case pageZoneItemAllMembers:
-			var zone, item = zoneItem%len(fs.Zones), zoneItem/len(fs.Zones)
+			var zone, item = zoneItem % len(fs.Zones), zoneItem / len(fs.Zones)
 			return fs.rotatedZoneItemArcs(zone, item, id), pr.PageEOF
 		default:
 			panic("invalid PageToken")
@@ -401,8 +465,10 @@ func (fs *sparseFlowNetwork) buildCurrentZoneItemArcs(zoneItem int) []pr.Arc {
 	return arcs
 }
 
-// rotatedZoneItemArcs returns the Arcs to all Members of |zone|, rotated so
-// that the Arc preferred first varies with |item|.
+// rotatedZoneItemArcs returns the Arcs to all Members of |zone|, ordered to
+// prefer Members currently holding fewer Assignments of the Item's group
+// (see itemGroup and groupMemberCounts), with ties broken by a rotation
+// which varies with |item|.
 //
 // Zone-Item Node IDs are assigned sequentially following Item order (see
 // newSparseFlowNetwork). The solver itself also shifts its Arc traversal by
@@ -424,6 +490,16 @@ func (fs *sparseFlowNetwork) buildCurrentZoneItemArcs(zoneItem int) []pr.Arc {
 // between consecutive Items of a zone (regardless of len(Zones)), which is
 // coprime with any Member count, guaranteeing every Member is preferred
 // first by some Item within any run of len(Members) consecutive Items.
+//
+// That rotation alone only prevents Items of a group from clustering when
+// they're solved together in one pass (eg, a batch-created set of
+// partitions). It doesn't help when a group's Items are added over time
+// alongside substantial, unevenly-distributed unrelated load: the solver's
+// member-capacity "fair share" (see buildMemberArc) is computed across *all*
+// Items, so it may still prefer whichever Member has the most spare overall
+// capacity, regardless of how many of *this* group it already holds. We
+// therefore also stable-sort by ascending per-group Member count, which
+// takes priority over (but preserves, for ties) the rotation above.
 func (fs *sparseFlowNetwork) rotatedZoneItemArcs(zone, item int, nid pr.NodeID) []pr.Arc {
 	var arcs = fs.allZoneItemArcsByZone[zone]
 	var l = len(arcs)
@@ -433,12 +509,20 @@ func (fs *sparseFlowNetwork) rotatedZoneItemArcs(zone, item int, nid pr.NodeID) 
 	// The solver will next shift our returned Arcs by (nid % l). Pre-rotate
 	// by (item - nid) % l so the two shifts compose to exactly (item % l).
 	var shift = ((item-int(nid))%l + l) % l
-	if shift == 0 {
-		return arcs
-	}
+
 	var out = fs.rotationScratch[:l]
-	var n = copy(out, arcs[shift:])
-	copy(out[n:], arcs[:shift])
+	if shift == 0 {
+		copy(out, arcs)
+	} else {
+		var n = copy(out, arcs[shift:])
+		copy(out[n:], arcs[:shift])
+	}
+
+	if counts := fs.groupMemberCounts[itemGroup(itemAt(fs.myItems, item).ID)]; counts != nil {
+		sort.SliceStable(out, func(i, j int) bool {
+			return counts[int(out[i].To-fs.firstMemberNodeID)] < counts[int(out[j].To-fs.firstMemberNodeID)]
+		})
+	}
 	return out
 }
 

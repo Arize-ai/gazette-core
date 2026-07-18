@@ -58,3 +58,15 @@ The algorithm prioritizes:
 - **Balance**: Even distribution across Members and zones  
 - **Availability**: Maintains replication during reassignments
 - **Performance**: Incremental updates scale linearly with Items
+
+Balance is evaluated at two levels. Primarily, the allocator balances *total*
+Item load per Member. Additionally, Items are inferred to belong to a
+"group" if their ID is a hierarchical path whose final segment is a
+partition-like suffix (eg, `a-topic/part-003`; see `itemGroup` in
+`sparse_flow_network.go`). The solver prefers Members currently holding
+fewer Assignments of an Item's group when choosing where to place it, so
+that partitions of the same logical journal or shard spread evenly across
+Members even when the Cluster's overall load is not perfectly even (eg, due
+to other, unrelated Items). This preference is soft: it can't override a
+Member's hard capacity limit, so pathological pre-existing imbalance can
+still leave a group imperfectly spread.

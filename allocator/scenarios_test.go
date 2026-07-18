@@ -2,7 +2,9 @@ package allocator
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -84,6 +86,77 @@ func TestInitialAllocationRegressionIssue157(t *testing.T) {
 		"/root/assign/item-07#zone-a#member-A2#1",
 		"/root/assign/item-07#zone-b#member-B1#2",
 	})
+}
+
+// TestPartitionedItemsBalanceAcrossMembers is a regression test guarding
+// against Items sharing a common name prefix (eg, partitions of a logical
+// journal such as "a-topic/part-000", "a-topic/part-001", ...) clustering
+// onto a small subset of Members. Such Items sort adjacently and are solved
+// together, so a naive Arc-traversal order keyed on Node position can
+// systematically prefer the same few Members for all of them (see
+// rotatedZoneItemArcs in sparse_flow_network.go).
+func TestPartitionedItemsBalanceAcrossMembers(t *testing.T) {
+	var ctx, client, ks = testSetup(t)
+
+	var kv []string
+	for _, suffix := range []string{"A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8"} {
+		kv = append(kv, "/root/members/zone-a#member-"+suffix, `{"R": 100}`)
+	}
+	for i := 0; i != 16; i++ {
+		kv = append(kv, fmt.Sprintf("/root/items/a-topic/part-%02d", i), `{"R": 1}`)
+	}
+	require.NoError(t, insert(ctx, client, kv...))
+	require.Equal(t, serveUntilIdle(t, ctx, client, ks, ""), 2)
+
+	// Expect each of the 8 Members is assigned exactly two of the 16 Items.
+	var counts = make(map[string]int)
+	for _, kv := range ks.Prefixed(ks.Root + AssignmentsPrefix) {
+		counts[kv.Decoded.(Assignment).MemberSuffix]++
+	}
+	require.Equal(t, map[string]int{
+		"member-A1": 2, "member-A2": 2, "member-A3": 2, "member-A4": 2,
+		"member-A5": 2, "member-A6": 2, "member-A7": 2, "member-A8": 2,
+	}, counts)
+}
+
+// TestPartitionedItemsBalanceAcrossMembersWithUnrelatedLoad extends
+// TestPartitionedItemsBalanceAcrossMembers by also placing substantial
+// unrelated ("noise") load onto the same Members before the grouped Items
+// are added, one at a time, exactly as they would be if a logical journal's
+// partitions were declared incrementally on a Cluster that's already
+// serving many other unrelated journals. Item-group balance must not
+// degrade merely because Members already differ in *total* Item count.
+func TestPartitionedItemsBalanceAcrossMembersWithUnrelatedLoad(t *testing.T) {
+	var ctx, client, ks = testSetup(t)
+
+	var kv []string
+	for _, suffix := range []string{"A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8"} {
+		kv = append(kv, "/root/members/zone-a#member-"+suffix, `{"R": 2000}`)
+	}
+	for i := 0; i != 304; i++ {
+		kv = append(kv, fmt.Sprintf("/root/items/unrelated-topic/part-%03d", i), `{"R": 1}`)
+	}
+	require.NoError(t, insert(ctx, client, kv...))
+	serveUntilIdle(t, ctx, client, ks, "")
+
+	// Add the grouped Items one at a time, as they'd be declared over time.
+	for i := 0; i != 16; i++ {
+		require.NoError(t, insert(ctx, client,
+			fmt.Sprintf("/root/items/a-topic/part-%02d", i), `{"R": 1}`))
+		serveUntilIdle(t, ctx, client, ks, "")
+	}
+
+	var counts = make(map[string]int)
+	for _, kv := range ks.Prefixed(ks.Root + AssignmentsPrefix) {
+		var a = kv.Decoded.(Assignment)
+		if strings.HasPrefix(a.ItemID, "a-topic/") {
+			counts[a.MemberSuffix]++
+		}
+	}
+	require.Equal(t, map[string]int{
+		"member-A1": 2, "member-A2": 2, "member-A3": 2, "member-A4": 2,
+		"member-A5": 2, "member-A6": 2, "member-A7": 2, "member-A8": 2,
+	}, counts)
 }
 
 func TestReplaceWhenNotConsistent(t *testing.T) {
