@@ -2,10 +2,12 @@ package allocator
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	epb "go.etcd.io/etcd/api/v3/etcdserverpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.gazette.dev/core/allocator/sparse_push_relabel"
 	"go.gazette.dev/core/etcdtest"
 	gc "gopkg.in/check.v1"
 )
@@ -50,6 +52,135 @@ func (s *AllocatorSuite) TestRemoveDeadAssignments(c *gc.C) {
 		clientv3.OpDelete("/root/assign/item-two#us-east#bar#0"),
 		clientv3.OpDelete("/root/assign/item-two#us-west#baz#1"),
 	})
+}
+
+func (s *AllocatorSuite) TestPrimaryFlowNetworkRebalancesSkewedPrimaries(c *gc.C) {
+	var client, ctx = etcdtest.TestClient(), context.Background()
+	defer etcdtest.Cleanup()
+
+	for k, v := range map[string]string{
+		"/root/items/a-topic/part-00": `{"R": 2}`,
+		"/root/items/a-topic/part-01": `{"R": 2}`,
+		"/root/items/a-topic/part-02": `{"R": 2}`,
+		"/root/items/singleton":       `{"R": 1}`, // Not a multi-Item group: excluded.
+
+		"/root/members/zone#member-0": `{"R": 10}`,
+		"/root/members/zone#member-1": `{"R": 10}`,
+
+		// a-topic's primaries (Slot 0) skew heavily towards member-0, though
+		// both Members replicate every Item (so any Item could take over).
+		"/root/assign/a-topic/part-00#zone#member-0#0": ``,
+		"/root/assign/a-topic/part-00#zone#member-1#1": ``,
+		"/root/assign/a-topic/part-01#zone#member-0#0": ``,
+		"/root/assign/a-topic/part-01#zone#member-1#1": ``,
+		"/root/assign/a-topic/part-02#zone#member-0#0": ``,
+		"/root/assign/a-topic/part-02#zone#member-1#1": ``,
+
+		"/root/assign/singleton#zone#member-0#0": ``,
+	} {
+		var _, err = client.Put(ctx, k, v)
+		c.Assert(err, gc.IsNil)
+	}
+	var ks = NewAllocatorKeySpace("/root", testAllocDecoder{})
+	c.Check(ks.Load(ctx, client, 0), gc.IsNil)
+
+	var network = newPrimaryFlowNetwork(
+		ks.Prefixed(ks.Root+ItemsPrefix),
+		ks.Prefixed(ks.Root+AssignmentsPrefix),
+	)
+	var desired = network.extractPrimaries(sparse_push_relabel.FindMaxFlow(network))
+
+	// Every tracked-group Item is assigned exactly one primary, and the
+	// singleton "singleton" Item is untouched by this network entirely.
+	c.Check(desired, gc.HasLen, 3)
+	_, ok := desired["singleton"]
+	c.Check(ok, gc.Equals, false)
+
+	// With 3 Items split across 2 Members, fair share is 2 and 1 -- the
+	// most even split actually achievable -- regardless of which specific
+	// Member started out over-loaded.
+	var counts = summarizeDesiredPrimaries(desired)["a-topic"]
+	var lo, hi = 1 << 30, 0
+	for _, n := range counts {
+		lo, hi = min(lo, n), max(hi, n)
+	}
+	c.Check(lo, gc.Equals, 1)
+	c.Check(hi, gc.Equals, 2)
+}
+
+// TestPrimaryFlowNetworkIsStableFixedPoint is a regression test for a bug
+// where discharge()'s deterministic Arc-order shift (see push_relabel.go,
+// `arcShift = int(nid) % len(arcs)`) silently defeated the PushFront-based
+// preference for an Item's current primary whenever an Item's NodeID landed
+// on a non-zero shift. Because primaryFlowNetwork is re-solved fresh every
+// converge() round from the *current* Assignments, an unstable preference
+// caused a genuine 2-cycle in production: each round "corrected" a primary
+// departure the shift itself had caused the round before, so the allocator
+// never reached an idle state and Allocate() spun forever.
+//
+// This test re-solves the network many times in a row, each time seeding
+// the next solve's "current primary" from the previous solve's output
+// (exactly as converge() does across successive rounds against Etcd) and
+// asserts the solution never changes after its first stabilization -- ie
+// primaryFlowNetwork is a stable fixed point, not an oscillator.
+func (s *AllocatorSuite) TestPrimaryFlowNetworkIsStableFixedPoint(c *gc.C) {
+	var client, ctx = etcdtest.TestClient(), context.Background()
+	defer etcdtest.Cleanup()
+
+	var kv = map[string]string{
+		"/root/members/zone-a#member-1": `{"R": 100}`,
+		"/root/members/zone-a#member-2": `{"R": 100}`,
+		"/root/members/zone-a#member-3": `{"R": 100}`,
+		"/root/members/zone-a#member-4": `{"R": 100}`,
+		"/root/members/zone-b#member-1": `{"R": 100}`,
+		"/root/members/zone-b#member-2": `{"R": 100}`,
+		"/root/members/zone-b#member-3": `{"R": 100}`,
+		"/root/members/zone-b#member-4": `{"R": 100}`,
+	}
+	// 16 Items of a single group, each replicated by one zone-a and one
+	// zone-b Member, mirroring TestPartitionedItemsBalanceAcrossZonedMembers
+	// (whose Item NodeIDs span both even and odd Arc shifts).
+	var zoneA, zoneB = []string{"1", "2", "3", "4"}, []string{"1", "2", "3", "4"}
+	for i := 0; i != 16; i++ {
+		var id = fmt.Sprintf("a-topic/part-%02d", i)
+		kv["/root/items/"+id] = `{"R": 2}`
+		kv["/root/assign/"+id+"#zone-a#member-"+zoneA[i%len(zoneA)]+"#0"] = ``
+		kv["/root/assign/"+id+"#zone-b#member-"+zoneB[i%len(zoneB)]+"#1"] = ``
+	}
+	for k, v := range kv {
+		var _, err = client.Put(ctx, k, v)
+		c.Assert(err, gc.IsNil)
+	}
+	var ks = NewAllocatorKeySpace("/root", testAllocDecoder{})
+	c.Check(ks.Load(ctx, client, 0), gc.IsNil)
+
+	var items = ks.Prefixed(ks.Root + ItemsPrefix)
+	var assignments = ks.Prefixed(ks.Root + AssignmentsPrefix)
+
+	var last map[string]string
+	for round := 0; round != 6; round++ {
+		var network = newPrimaryFlowNetwork(items, assignments)
+		var next = network.extractPrimaries(sparse_push_relabel.FindMaxFlow(network))
+		c.Check(next, gc.HasLen, 16)
+
+		if round > 0 {
+			c.Check(next, gc.DeepEquals, last,
+				gc.Commentf("primary selection changed on round %d despite unchanged fair-share pressure", round))
+		}
+		last = next
+
+		// Apply |next| back onto |assignments|' Slots, exactly as
+		// constrainReorders would, ahead of the following round's solve.
+		for i := range assignments {
+			var a = assignmentAt(assignments, i)
+			if a.Slot == 0 && next[a.ItemID] != memberKeyOf(a) {
+				a.Slot = 1
+			} else if a.Slot != 0 && next[a.ItemID] == memberKeyOf(a) {
+				a.Slot = 0
+			}
+			assignments[i].Decoded = a
+		}
+	}
 }
 
 func (s *AllocatorSuite) TestConvergeFixtureCases(c *gc.C) {

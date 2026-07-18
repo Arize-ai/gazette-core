@@ -41,6 +41,10 @@ It provides the core scheduling intelligence that keeps Gazette services highly 
 - Item IDs sharing a logical "group" (eg partitions of a common topic, via
   `itemGroup`) are additionally balanced across Members *within* their group,
   through an intervening layer of Group-Member nodes -- see below.
+- `primaryFlowNetwork`: A second, much smaller max-flow network solved every
+  convergence round, which independently balances *primary* (Slot 0)
+  Assignments of a tracked group across Members -- see "Primary balancing"
+  below.
 
 ## Brief Architecture
 
@@ -101,3 +105,43 @@ demand for `R > 1` in a single-zone cluster, which sets the cap far too low;
 it's relaxed under pressure almost immediately, and because that relaxation
 kicks in per-Group-Member rather than uniformly, one arbitrary Member ends up
 absorbing the bulk of the group instead of the load spreading evenly.
+
+## Primary balancing
+
+Group-aware balancing (above) keeps overall replica *membership* even across
+Members, but replica membership alone doesn't guarantee an even spread of
+*primaries* (the Slot 0 Assignment of each Item, which typically bears extra
+load -- eg it alone accepts writes). Two groups can have perfectly balanced
+membership while one Member happens to hold a disproportionate share of
+primaries, since which replica is primary is a largely independent decision
+from which Members replicate an Item at all.
+
+`primaryFlowNetwork` (`primary_flow_network.go`) solves this as its own,
+much smaller max-flow problem, run once per convergence round for every
+tracked multi-Item group:
+
+	Source -> Item (cap 1) -> Group-Member (fair-share cap, relaxed) -> Sink
+
+Every Item of a tracked group contributes one unit of source flow, which
+must land on one of the Item's *current* replica Members -- this network
+only ever chooses *which* replica is primary, never *which* Members
+replicate the Item (that remains `sparseFlowNetwork`'s job, and is treated
+as fixed input here). A Group-Member's arc to the Sink is capacity-bound to
+that Member's fair share of the group's primaries, relaxed under pressure
+exactly as `buildGroupMemberArc` relaxes overall membership, so a complete
+assignment (one primary per Item) is always reached.
+
+`itemState.constrainReorders` consults the resulting `desiredPrimary`
+selection when deciding which replica to promote, but only follows it once
+the desired replica is itself consistent -- an inconsistent replica is never
+promoted over a consistent current primary, preserving availability over
+strict fairness.
+
+Because the network is re-solved from scratch every round based on the
+*current* primary assignment (there's no persistent state or caching, unlike
+`sparseFlowNetwork`'s NetworkHash-gated re-solve), the arcs from each Item
+node must deterministically prefer that Item's current primary, or the
+allocator can cycle indefinitely -- see the "current primary" rotation logic
+in `Arcs()`, which counteracts `sparse_push_relabel`'s node-based Arc-order
+shift specifically to guarantee this network is a stable fixed point once
+balanced.

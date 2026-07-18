@@ -201,6 +201,109 @@ func (s *ItemStateSuite) TestPrimaryAlreadyExists(c *gc.C) {
 	c.Check(is.reorder, gc.DeepEquals, current)
 }
 
+func (s *ItemStateSuite) TestDesiredPrimarySwapsExistingPrimary(c *gc.C) {
+	var ks, is = buildItemStateFixture(c, map[string]string{
+		"/root/items/item": `{"R": 2}`,
+
+		"/root/members/zone#member-0": `{"R": 10}`,
+		"/root/members/zone#member-1": `{"R": 10}`,
+
+		"/root/assign/item#zone#member-0#0": `consistent`,
+		"/root/assign/item#zone#member-1#1": `consistent`,
+	})
+	// Simulate that a primaryFlowNetwork solve chose member-1 as this
+	// Item's fair-share primary, despite member-0 currently holding it.
+	is.desiredPrimary = map[string]string{"item": "zone#member-1"}
+	var current = ks.Prefixed(ItemAssignmentsPrefix(ks, "item"))
+
+	is.init(0, current, []Assignment{
+		{ItemID: "item", MemberZone: "zone", MemberSuffix: "member-0"},
+		{ItemID: "item", MemberZone: "zone", MemberSuffix: "member-1"},
+	})
+
+	// Expect primary swaps to member-1. member-1's global count is credited
+	// later by buildPromoteOps, exactly as it is when filling a vacancy;
+	// member-0's is debited immediately, since buildPackOps (which will
+	// shift it to a non-zero Slot) has no notion of primaries.
+	is.constrainReorders()
+	c.Check(is.reorder, gc.DeepEquals, keyspace.KeyValues{current[1], current[0]})
+	c.Check(is.global.MemberPrimaryCount, gc.DeepEquals, []int{0, 0})
+}
+
+func (s *ItemStateSuite) TestDesiredPrimaryNoopWhenAlreadyCorrect(c *gc.C) {
+	var ks, is = buildItemStateFixture(c, map[string]string{
+		"/root/items/item": `{"R": 2}`,
+
+		"/root/members/zone#member-0": `{"R": 10}`,
+		"/root/members/zone#member-1": `{"R": 10}`,
+
+		"/root/assign/item#zone#member-0#0": `consistent`,
+		"/root/assign/item#zone#member-1#1": `consistent`,
+	})
+	// The desired primary already matches the current one: no change.
+	is.desiredPrimary = map[string]string{"item": "zone#member-0"}
+	var current = ks.Prefixed(ItemAssignmentsPrefix(ks, "item"))
+
+	is.init(0, current, []Assignment{
+		{ItemID: "item", MemberZone: "zone", MemberSuffix: "member-0"},
+		{ItemID: "item", MemberZone: "zone", MemberSuffix: "member-1"},
+	})
+
+	is.constrainReorders()
+	c.Check(is.reorder, gc.DeepEquals, current)
+	c.Check(is.global.MemberPrimaryCount, gc.DeepEquals, []int{1, 0})
+}
+
+func (s *ItemStateSuite) TestDesiredPrimarySkipsInconsistentAlternative(c *gc.C) {
+	var ks, is = buildItemStateFixture(c, map[string]string{
+		"/root/items/item": `{"R": 2}`,
+
+		"/root/members/zone#member-0": `{"R": 10}`,
+		"/root/members/zone#member-1": `{"R": 10}`,
+
+		"/root/assign/item#zone#member-0#0": `consistent`,
+		"/root/assign/item#zone#member-1#1": ``, // Not consistent: not yet synchronized.
+	})
+	is.desiredPrimary = map[string]string{"item": "zone#member-1"}
+	var current = ks.Prefixed(ItemAssignmentsPrefix(ks, "item"))
+
+	is.init(0, current, []Assignment{
+		{ItemID: "item", MemberZone: "zone", MemberSuffix: "member-0"},
+		{ItemID: "item", MemberZone: "zone", MemberSuffix: "member-1"},
+	})
+
+	// Despite the solve's preference, member-1 cannot yet be promoted since
+	// it's not consistent: fall through to the default (no disturbance).
+	is.constrainReorders()
+	c.Check(is.reorder, gc.DeepEquals, current)
+}
+
+func (s *ItemStateSuite) TestDesiredPrimaryFillsVacancy(c *gc.C) {
+	var ks, is = buildItemStateFixture(c, map[string]string{
+		"/root/items/item": `{"R": 1}`,
+
+		// Member item limits would normally make member-0 the preferred
+		// promotion (lowest overall primary load ratio -- see
+		// TestPromoteWithNoCurrentPrimary), but the solve's preference for
+		// member-1 should take precedence.
+		"/root/members/zone#member-0": `{"R": 3}`,
+		"/root/members/zone#member-1": `{"R": 1}`,
+
+		"/root/assign/item#zone#member-0#1": `consistent`,
+		"/root/assign/item#zone#member-1#2": `consistent`,
+	})
+	is.desiredPrimary = map[string]string{"item": "zone#member-1"}
+	var current = ks.Prefixed(ItemAssignmentsPrefix(ks, "item"))
+
+	is.init(0, current, []Assignment{
+		{ItemID: "item", MemberZone: "zone", MemberSuffix: "member-0"},
+		{ItemID: "item", MemberZone: "zone", MemberSuffix: "member-1"},
+	})
+
+	is.constrainReorders()
+	c.Check(is.reorder, gc.DeepEquals, keyspace.KeyValues{current[1], current[0]})
+}
+
 func (s *ItemStateSuite) TestAddMemberConstraints(c *gc.C) {
 	var ks, is = buildItemStateFixture(c, map[string]string{
 		"/root/items/item": `{"R": 1}`,

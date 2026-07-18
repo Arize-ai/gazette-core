@@ -111,8 +111,9 @@ func Allocate(args AllocateArgs) error {
 				modRevisionUnchanged(state.Members[state.LocalMemberInd]))
 
 			// Converge the current state towards |desired|.
+			var groupPrimaryCounts map[string]map[string]int
 			var err error
-			if err = converge(txn, state, desired); err == nil {
+			if groupPrimaryCounts, err = converge(txn, state, desired); err == nil {
 				err = txn.Flush()
 			}
 
@@ -132,6 +133,11 @@ func Allocate(args AllocateArgs) error {
 				allocatorNumItems.Set(float64(len(state.Items)))
 				allocatorNumItemSlots.Set(float64(state.ItemSlots))
 
+				if txn.Revision() != 0 {
+					// Only log if this round actually applied changes, to
+					// avoid spamming idle rounds with a no-op summary.
+					logPrimaryBalance(groupPrimaryCounts)
+				}
 				if args.TestHook != nil {
 					args.TestHook(round, txn.Revision() == 0)
 				}
@@ -150,9 +156,17 @@ func Allocate(args AllocateArgs) error {
 // current state closer to the |desired| state. A change is allowed iff it does
 // not cause any Item or Member replication constraints to be violated (eg, by
 // leaving an Item with too few consistent replicas, or a Member with too many
-// assigned Items).
-func converge(txn checkpointTxn, as *State, desired []Assignment) error {
-	var itemState = itemState{global: as}
+// assigned Items). It returns a per-group summary of primary (Slot == 0)
+// Assignment counts by Member, reflecting the primary-balance decisions
+// (see primaryFlowNetwork) applied during this round.
+func converge(txn checkpointTxn, as *State, desired []Assignment) (map[string]map[string]int, error) {
+	var primaryNetwork = newPrimaryFlowNetwork(as.Items, as.Assignments)
+	var desiredPrimary = primaryNetwork.extractPrimaries(sparse_push_relabel.FindMaxFlow(primaryNetwork))
+
+	var itemState = itemState{
+		global:         as,
+		desiredPrimary: desiredPrimary,
+	}
 	var lastCRE int // cur.RightEnd of the previous iteration.
 
 	// Walk Items, joined with their current Assignments. Simultaneously walk
@@ -168,7 +182,7 @@ func converge(txn checkpointTxn, as *State, desired []Assignment) error {
 		// Remove any Assignments skipped between the last cursor iteration, and this
 		// one. They must not have an associated Item (eg, it was deleted).
 		if err := removeDeadAssignments(txn, as.KS, as.Assignments[lastCRE:cur.RightBegin]); err != nil {
-			return err
+			return nil, err
 		}
 		lastCRE = cur.RightEnd
 
@@ -180,16 +194,35 @@ func converge(txn checkpointTxn, as *State, desired []Assignment) error {
 		// Initialize |itemState|, computing the delta of current and |desired| Item Assignments.
 		itemState.init(cur.Left, as.Assignments[cur.RightBegin:cur.RightEnd], desired[:limit])
 		if err := itemState.constrainAndBuildOps(txn); err != nil {
-			return err
+			return nil, err
 		}
 		desired = desired[limit:]
 	}
 	// Remove any trailing, dead Assignments.
 	if err := removeDeadAssignments(txn, as.KS, as.Assignments[lastCRE:]); err != nil {
-		return err
+		return nil, err
 	}
 
-	return nil
+	return summarizeDesiredPrimaries(desiredPrimary), nil
+}
+
+// summarizeDesiredPrimaries returns, for every tracked multi-Item group (see
+// itemGroup) represented in |desiredPrimary| (see primaryFlowNetwork), a
+// count of primary Assignments by Member ("zone#suffix") that the max-flow
+// solve selected for that group. This reflects the *decision* applied this
+// round, which -- absent any other constraint (eg an Item lacking a
+// consistent replica) -- converges to the actual Etcd state within a round
+// or two.
+func summarizeDesiredPrimaries(desiredPrimary map[string]string) map[string]map[string]int {
+	var counts = make(map[string]map[string]int)
+	for itemID, memberKey := range desiredPrimary {
+		var group = itemGroup(itemID)
+		if counts[group] == nil {
+			counts[group] = make(map[string]int)
+		}
+		counts[group][memberKey]++
+	}
+	return counts
 }
 
 // removeDeadAssignments removes Assignments |asn|, after verifying each has no associated Item.
@@ -323,6 +356,38 @@ func logGroupBalance(desired []Assignment) {
 			log.WithFields(fields).Warn("group balance wider than expected")
 		} else {
 			log.WithFields(fields).Info("group balance")
+		}
+	}
+}
+
+// logPrimaryBalance logs, at Info level (so it's visible without enabling
+// Debug logging), a per-group summary of how evenly primary (Slot == 0)
+// Assignments are spread across Members, mirroring logGroupBalance's
+// treatment of overall Assignment spread. It warns instead if any group's
+// spread exceeds what a perfectly even split would require. A wider spread
+// is not necessarily a bug -- rebalanceGroupPrimary only swaps a primary
+// when doing so is a clear improvement, and settles gradually across
+// several convergence rounds -- but it's a useful signal that primary
+// balance hasn't yet reached (or can't reach) a fair-share equilibrium.
+func logPrimaryBalance(byGroup map[string]map[string]int) {
+	for group, counts := range byGroup {
+		if len(counts) <= 1 {
+			continue // Not a multi-Item group Assignment is spread over.
+		}
+		var min, max = 1 << 30, 0
+		for _, c := range counts {
+			if c < min {
+				min = c
+			}
+			if c > max {
+				max = c
+			}
+		}
+		var fields = log.Fields{"group": group, "spread.min": min, "spread.max": max, "members": counts}
+		if max-min > 1 {
+			log.WithFields(fields).Warn("primary balance wider than expected")
+		} else {
+			log.WithFields(fields).Info("primary balance")
 		}
 	}
 }

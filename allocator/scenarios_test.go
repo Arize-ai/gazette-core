@@ -1008,6 +1008,86 @@ func TestPartitionedItemsBalanceWithReplication(t *testing.T) {
 	}, groupCountsByMember(ks, "a-topic"))
 }
 
+// TestPrimaryBalanceIndependentOfReplicaMembership verifies that primary
+// (Slot 0) Assignments are rebalanced within a group even when replica
+// membership itself is already perfectly balanced and stable -- ie, the two
+// concerns are handled independently. It seeds a settled, balanced cluster,
+// then directly swaps Slot numbers (without altering which Members replicate
+// which Items) to artificially skew primaries onto a single Member, and
+// verifies the Allocator restores primary balance without perturbing
+// replica membership at all.
+func TestPrimaryBalanceIndependentOfReplicaMembership(t *testing.T) {
+	var ctx, client, ks = testSetup(t)
+
+	var kv []string
+	for i := 0; i != 8; i++ {
+		kv = append(kv, itemKey("a-topic/part-%02d", i), `{"R": 2}`)
+	}
+	for _, suffix := range []string{"A1", "A2", "A3", "A4"} {
+		kv = append(kv, "/root/members/zone-a#member-"+suffix, `{"R": 100}`)
+	}
+	require.NoError(t, insert(ctx, client, kv...))
+	serveUntilIdle(t, ctx, client, ks, "")
+
+	var baseline = groupCountsByMember(ks, "a-topic")
+	require.Equal(t, map[string]int{
+		"member-A1": 4, "member-A2": 4, "member-A3": 4, "member-A4": 4,
+	}, baseline)
+
+	// Group Assignments by Item, then force member-A1 to primary for every
+	// a-topic Item it currently replicates (swapping Slots with whichever
+	// Member is currently primary). This leaves each Item's 2-Member
+	// replica set completely untouched -- only which of the two is Slot 0.
+	var byItem = make(map[string]keyspace.KeyValues)
+	for _, kv := range ks.Prefixed(ks.Root + AssignmentsPrefix) {
+		var a = kv.Decoded.(Assignment)
+		if itemGroup(a.ItemID) == "a-topic" {
+			byItem[a.ItemID] = append(byItem[a.ItemID], kv)
+		}
+	}
+
+	var ops []clientv3.Op
+	for _, asn := range byItem {
+		var primary, other = asn[0], asn[1]
+		if primary.Decoded.(Assignment).Slot != 0 {
+			primary, other = other, primary
+		}
+		var pa, oa = primary.Decoded.(Assignment), other.Decoded.(Assignment)
+		if oa.MemberSuffix != "member-A1" {
+			continue // member-A1 doesn't replicate this Item, or is already primary.
+		}
+		pa.Slot, oa.Slot = 1, 0
+
+		ops = append(ops,
+			clientv3.OpDelete(string(primary.Raw.Key)),
+			clientv3.OpPut(AssignmentKey(ks, pa), string(primary.Raw.Value),
+				clientv3.WithLease(clientv3.LeaseID(primary.Raw.Lease))),
+			clientv3.OpDelete(string(other.Raw.Key)),
+			clientv3.OpPut(AssignmentKey(ks, oa), string(other.Raw.Value),
+				clientv3.WithLease(clientv3.LeaseID(other.Raw.Lease))),
+		)
+	}
+	require.NotEmpty(t, ops, "expected member-A1 to be a non-primary replica of at least one Item")
+
+	var _, err = client.Txn(ctx).Then(ops...).Commit()
+	require.NoError(t, err)
+
+	serveUntilIdle(t, ctx, client, ks, "")
+
+	// Replica membership is completely unaffected by primary rebalancing.
+	require.Equal(t, baseline, groupCountsByMember(ks, "a-topic"))
+
+	// But primary balance has been restored to a spread of at most one.
+	var primaries = primaryCountsByMember(ks, "a-topic")
+	require.Len(t, primaries, 4, "expected all four Members to hold at least one primary: %v", primaries)
+
+	var lo, hi = 1 << 30, 0
+	for _, n := range primaries {
+		lo, hi = min(lo, n), max(hi, n)
+	}
+	require.LessOrEqual(t, hi-lo, 1, "expected primaries to be rebalanced: %v", primaries)
+}
+
 // TestPartitionedItemsBalanceAcrossMembersWithUnrelatedLoad checks that
 // group balance holds even atop a cluster already carrying substantial,
 // unrelated (unevenly-distributed) load from other, singleton-group Items.
@@ -1128,6 +1208,19 @@ func groupCountsByMember(ks *keyspace.KeySpace, group string) map[string]int {
 	for _, kv := range ks.Prefixed(ks.Root + AssignmentsPrefix) {
 		var a = kv.Decoded.(Assignment)
 		if itemGroup(a.ItemID) == group {
+			counts[a.MemberSuffix]++
+		}
+	}
+	return counts
+}
+
+// primaryCountsByMember returns, for the given logical group, the count of
+// current primary (Slot == 0) Assignments held by each Member suffix.
+func primaryCountsByMember(ks *keyspace.KeySpace, group string) map[string]int {
+	var counts = make(map[string]int)
+	for _, kv := range ks.Prefixed(ks.Root + AssignmentsPrefix) {
+		var a = kv.Decoded.(Assignment)
+		if a.Slot == 0 && itemGroup(a.ItemID) == group {
 			counts[a.MemberSuffix]++
 		}
 	}
