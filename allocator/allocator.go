@@ -97,6 +97,11 @@ func Allocate(args AllocateArgs) error {
 					log.WithField("unattainableReplicas", state.ItemSlots-len(desired)).
 						Warn("cannot reach desired replication for all items")
 				}
+				if log.IsLevelEnabled(log.DebugLevel) {
+					logAssignmentDiff(state.Assignments, desired)
+				}
+				logGroupBalance(desired)
+
 				lastNetworkHash = state.NetworkHash
 			}
 
@@ -233,6 +238,92 @@ func SolveDesiredAssignments(s *State, desired []Assignment) []Assignment {
 		desired = network.extractAssignments(maxFlow, desired)
 	}
 	return desired
+}
+
+// logAssignmentDiff logs, at Debug level, every individual Assignment
+// addition and removal implied by shifting `current` to `desired`. This is
+// intentionally verbose and is meant to be enabled only when actively
+// diagnosing a specific allocation decision.
+func logAssignmentDiff(current keyspace.KeyValues, desired []Assignment) {
+	for lhs, rhs := current, desired; len(lhs) != 0 || len(rhs) != 0; {
+		var cmp int
+		var lh Assignment
+		if len(lhs) != 0 {
+			lh = lhs[0].Decoded.(Assignment)
+		}
+
+		if len(lhs) == 0 {
+			cmp = 1
+		} else if len(rhs) == 0 {
+			cmp = -1
+		} else if rh := rhs[0]; lh.ItemID != rh.ItemID {
+			cmp = strings.Compare(lh.ItemID, rh.ItemID)
+		} else if lh.MemberZone != rh.MemberZone {
+			cmp = strings.Compare(lh.MemberZone, rh.MemberZone)
+		} else {
+			cmp = strings.Compare(lh.MemberSuffix, rh.MemberSuffix)
+		}
+
+		switch cmp {
+		case -1:
+			log.WithFields(log.Fields{
+				"item":   lh.ItemID,
+				"group":  itemGroup(lh.ItemID),
+				"zone":   lh.MemberZone,
+				"member": lh.MemberSuffix,
+			}).Debug("assignment removed")
+			lhs = lhs[1:]
+		case 1:
+			var rh = rhs[0]
+			log.WithFields(log.Fields{
+				"item":   rh.ItemID,
+				"group":  itemGroup(rh.ItemID),
+				"zone":   rh.MemberZone,
+				"member": rh.MemberSuffix,
+			}).Debug("assignment added")
+			rhs = rhs[1:]
+		case 0:
+			lhs, rhs = lhs[1:], rhs[1:]
+		}
+	}
+}
+
+// logGroupBalance logs a per-group summary of how evenly `desired` spreads
+// each multi-Item group's Assignments across Members, and warns if any
+// group's spread (its most- minus least-assigned Member) exceeds what a
+// perfectly even split would require. A wider spread is not necessarily a
+// bug -- the flow network relaxes its per-group fair-share cap rather than
+// leave Items unassigned -- but it's a useful signal that group balance is
+// being constrained by other factors (eg overall Member capacity).
+func logGroupBalance(desired []Assignment) {
+	var byGroup = make(map[string]map[string]int)
+	for _, a := range desired {
+		var g = itemGroup(a.ItemID)
+		if byGroup[g] == nil {
+			byGroup[g] = make(map[string]int)
+		}
+		byGroup[g][a.MemberZone+"#"+a.MemberSuffix]++
+	}
+	for group, counts := range byGroup {
+		if len(counts) <= 1 {
+			continue // Not a multi-Item group Assignment is spread over.
+		}
+		var min, max = 1 << 30, 0
+		for _, c := range counts {
+			if c < min {
+				min = c
+			}
+			if c > max {
+				max = c
+			}
+		}
+		var fields = log.Fields{"group": group, "spread.min": min, "spread.max": max, "members": counts}
+		if max-min > 1 {
+			log.WithFields(fields).Warn("group balance wider than expected")
+		} else {
+			log.WithFields(fields).Debug("group balance")
+		}
+	}
 }
 
 // Compute the total number of additions, removals, and unchanged assignments

@@ -335,6 +335,91 @@ func (s *SparseSuite) TestZoneBalancing(c *gc.C) {
 	})
 }
 
+func (s *SparseSuite) TestGroupMemberFairShare(c *gc.C) {
+	var client, ctx = etcdtest.TestClient(), context.Background()
+	defer etcdtest.Cleanup()
+
+	for k, v := range map[string]string{
+		"/root/items/topic/part-00": `{"R": 1}`,
+		"/root/items/topic/part-01": `{"R": 1}`,
+		"/root/items/topic/part-02": `{"R": 1}`,
+		"/root/items/topic/part-03": `{"R": 1}`,
+
+		"/root/members/A#one": `{"R": 4}`,
+		"/root/members/A#two": `{"R": 4}`,
+	} {
+		var _, err = client.Put(ctx, k, v)
+		c.Assert(err, gc.IsNil)
+	}
+	var ks = NewAllocatorKeySpace("/root", testAllocDecoder{})
+	var state = NewObservedState(ks, MemberKey(ks, "A", "one"), isConsistent)
+	c.Check(ks.Load(ctx, client, 0), gc.IsNil)
+
+	const (
+		I0 = pr.SinkID + 1 + iota
+		I1
+		I2
+		I3
+		I0A
+		I1A
+		I2A
+		I3A
+		G0 // Group-Member node for "topic" at Member "one".
+		G1 // Group-Member node for "topic" at Member "two".
+		MOne
+		MTwo
+	)
+	var fn = newSparseFlowNetwork(state, state.Items)
+
+	c.Check(fn.firstGroupMemberNodeID, gc.Equals, pr.NodeID(G0))
+	c.Check(fn.firstMemberNodeID, gc.Equals, pr.NodeID(MOne))
+	c.Check(fn.groupIndex, gc.DeepEquals, map[string]int{"topic": 0})
+	c.Check(fn.groupItemCounts, gc.DeepEquals, []int{4})
+
+	var mf = pr.FindMaxFlow(noopNetwork{fn})
+
+	// A Zone-Item's "all members" page routes through Group-Member nodes,
+	// rather than directly to Members, because "topic" has 4 (>1) Items.
+	verifyArcs(c, fn, mf, I0A, [][]pr.Arc{
+		{}, // No current assignment.
+		{
+			{To: G0, Capacity: 1},
+			{To: G1, Capacity: 1},
+		},
+	})
+
+	// Each Group-Member's Arc to its Member is capped at the group's fair
+	// share within the zone (4 Items / 2 Members => 2 each), prior to any
+	// overflow relaxation.
+	verifyArcs(c, fn, mf, G0, [][]pr.Arc{
+		{{To: MOne, Capacity: 2}},
+	})
+	verifyArcs(c, fn, mf, G1, [][]pr.Arc{
+		{{To: MTwo, Capacity: 2}},
+	})
+
+	mf = pr.FindMaxFlow(fn) // Fully solve.
+
+	// Regardless of solver tie-breaking, the hard fair-share cap must ensure
+	// each Member has exactly 2 of "topic"'s 4 Items.
+	var byMember = make(map[string]int)
+	for _, a := range fn.extractAssignments(mf, nil) {
+		byMember[a.MemberSuffix]++
+	}
+	c.Check(byMember, gc.DeepEquals, map[string]int{"one": 2, "two": 2})
+}
+
+func (s *SparseSuite) TestItemGroup(c *gc.C) {
+	c.Check(itemGroup("a-topic/part-003"), gc.Equals, "a-topic")
+	c.Check(itemGroup("a-topic/part=012"), gc.Equals, "a-topic")
+	c.Check(itemGroup("nested/topic/name/part-99"), gc.Equals, "nested/topic/name")
+	c.Check(itemGroup("a-topic/not-numeric"), gc.Equals, "a-topic/not-numeric")
+	c.Check(itemGroup("no-slash-item"), gc.Equals, "no-slash-item")
+	c.Check(itemGroup("no-slash-item-007"), gc.Equals, "no-slash-item-007")
+	c.Check(itemGroup("trailing-slash/"), gc.Equals, "trailing-slash/")
+	c.Check(itemGroup(""), gc.Equals, "")
+}
+
 func verifyArcs(c *gc.C, fs *sparseFlowNetwork, mf *pr.MaxFlow, from pr.NodeID, expect [][]pr.Arc) {
 	var page = pr.PageInitial
 

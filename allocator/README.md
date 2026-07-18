@@ -38,6 +38,9 @@ It provides the core scheduling intelligence that keeps Gazette services highly 
 ### Flow Network
 - `sparseFlowNetwork`: Models allocation as maximum flow problem
 - Uses `sparse_push_relabel` algorithm to solve optimal assignments
+- Item IDs sharing a logical "group" (eg partitions of a common topic, via
+  `itemGroup`) are additionally balanced across Members *within* their group,
+  through an intervening layer of Group-Member nodes -- see below.
 
 ## Brief Architecture
 
@@ -58,3 +61,33 @@ The algorithm prioritizes:
 - **Balance**: Even distribution across Members and zones  
 - **Availability**: Maintains replication during reassignments
 - **Performance**: Incremental updates scale linearly with Items
+
+## Group-aware balancing
+
+Overall load balancing is necessary but not sufficient: a cluster's *total*
+load can be perfectly even while a specific set of related Items -- eg the
+16 partitions of one topic -- pile onto just one or two Members. This is
+especially likely under repeated topology churn (eg a rolling Kubernetes
+Deployment restart, where every Member gets a brand-new random identity):
+each individual Member swap only reconsiders that Member's own orphaned
+Items, so imbalance among any one logical group can accumulate indefinitely
+even though the flow network is always re-solved to a legitimate maximum
+assignment.
+
+`itemGroup` infers a logical group from an Item ID: if the final
+`/`-delimited path segment ends in decimal digits, the group is the ID with
+that segment removed (`a-topic/part-003` groups with `a-topic`); otherwise
+the ID is its own singleton group. Groups with only one Item are never
+specially treated, since a single Item cannot itself cluster within a zone.
+
+For every other (multi-Item) group, `sparseFlowNetwork` inserts a
+**Group-Member** node for each `(zone, group, Member)` triple, sitting
+between Zone-Item and Member nodes. Every Zone-Item of that group, within
+that zone, is routed through the Group-Member node of its target Member
+rather than directly to the Member. The Group-Member's single outgoing arc
+is capacity-bound to that Member's fair share of the group within the zone
+(`ceil(groupSize / zoneMemberCount)`), enforcing balance as a hard flow
+constraint rather than a mere ordering preference. Exactly like Member
+fair-share (`buildMemberArc`), this cap is relaxed under sufficient network
+"pressure" (see `groupMemberOverflowThreshold`) so that group fairness never
+prevents an otherwise-achievable maximum assignment.
