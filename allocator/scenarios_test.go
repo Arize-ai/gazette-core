@@ -640,7 +640,7 @@ func TestScaleDownZonesThreeToTwo(t *testing.T) {
 		"/root/assign/item-1#zone-a#member-A1#0",
 		"/root/assign/item-1#zone-a#member-A2#1",
 		"/root/assign/item-1#zone-b#member-B#2",
-		"/root/assign/item-2#zone-a#member-A1#2",
+		"/root/assign/item-2#zone-a#member-A2#2",
 		"/root/assign/item-2#zone-a#member-A3#0",
 		"/root/assign/item-2#zone-b#member-B#1",
 	})
