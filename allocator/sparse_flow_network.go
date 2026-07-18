@@ -80,6 +80,10 @@ type sparseFlowNetwork struct {
 	// within a zone -- both should be small, but if we overflow that's fine,
 	// as append() will just allocate from heap instead.
 	scratch [8]pr.Arc
+	// rotationScratch is reused across calls to rotatedZoneItemArcs, sized to
+	// the largest of allZoneItemArcsByZone, to avoid a heap allocation on
+	// each call.
+	rotationScratch []pr.Arc
 }
 
 const (
@@ -172,6 +176,7 @@ func newSparseFlowNetwork(s *State, myItems keyspace.KeyValues) *sparseFlowNetwo
 
 	var memberSuffixIdxByZone = make([]map[string]pr.NodeID, len(s.Zones))
 	var allZoneItemArcsByZone = make([][]pr.Arc, len(s.Zones))
+	var maxZoneMembers int
 
 	// Left-join |Zones| with |Members| (which is ordered on Member zone, Member suffix).
 	it = LeftJoin{
@@ -194,6 +199,9 @@ func newSparseFlowNetwork(s *State, myItems keyspace.KeyValues) *sparseFlowNetwo
 			allZoneItemArcsByZone[zone] = append(allZoneItemArcsByZone[zone],
 				pr.Arc{To: id, Capacity: 1})
 		}
+		if n := cur.RightEnd - cur.RightBegin; n > maxZoneMembers {
+			maxZoneMembers = n
+		}
 	}
 
 	var fs = &sparseFlowNetwork{
@@ -206,6 +214,7 @@ func newSparseFlowNetwork(s *State, myItems keyspace.KeyValues) *sparseFlowNetwo
 		zoneItemAssignments:   zoneItemAssignments,
 		memberSuffixIdxByZone: memberSuffixIdxByZone,
 		allZoneItemArcsByZone: allZoneItemArcsByZone,
+		rotationScratch:       make([]pr.Arc, maxZoneMembers),
 	}
 	return fs
 }
@@ -273,7 +282,8 @@ func (fs *sparseFlowNetwork) Arcs(mf *pr.MaxFlow, id pr.NodeID, page pr.PageToke
 		case pr.PageInitial:
 			return fs.buildCurrentZoneItemArcs(zoneItem), pageZoneItemAllMembers
 		case pageZoneItemAllMembers:
-			return fs.allZoneItemArcsByZone[zoneItem%len(fs.Zones)], pr.PageEOF
+			var zone, item = zoneItem%len(fs.Zones), zoneItem/len(fs.Zones)
+			return fs.rotatedZoneItemArcs(zone, item, id), pr.PageEOF
 		default:
 			panic("invalid PageToken")
 		}
@@ -389,6 +399,47 @@ func (fs *sparseFlowNetwork) buildCurrentZoneItemArcs(zoneItem int) []pr.Arc {
 		}
 	}
 	return arcs
+}
+
+// rotatedZoneItemArcs returns the Arcs to all Members of |zone|, rotated so
+// that the Arc preferred first varies with |item|.
+//
+// Zone-Item Node IDs are assigned sequentially following Item order (see
+// newSparseFlowNetwork). The solver itself also shifts its Arc traversal by
+// a function of the discharging Node's ID (|nid|), to avoid the pathology of
+// many Nodes sharing common Arc structure all pushing along the same first
+// Arc (see discharge() and TestCommonSubstructureFixture). However that
+// shift strides by len(Zones) between the Zone-Item Nodes of consecutive
+// Items (in the same zone), so whenever len(Zones) shares a common factor
+// with the number of zone Members, only a fraction of Members are ever
+// reachable as a "first preference" -- and Items lacking a current
+// Assignment (eg, freshly created Items, such as the partitions of a newly
+// declared logical journal, which sort adjacently and are thus solved
+// together) can cluster onto just that subset of Members, even though
+// overall Member load remains balanced.
+//
+// We counteract this by pre-rotating the Arcs we return so that, once the
+// solver applies its own |nid|-based shift on top, the *net* effective
+// shift is a function of |item| alone. |item| always strides by exactly one
+// between consecutive Items of a zone (regardless of len(Zones)), which is
+// coprime with any Member count, guaranteeing every Member is preferred
+// first by some Item within any run of len(Members) consecutive Items.
+func (fs *sparseFlowNetwork) rotatedZoneItemArcs(zone, item int, nid pr.NodeID) []pr.Arc {
+	var arcs = fs.allZoneItemArcsByZone[zone]
+	var l = len(arcs)
+	if l == 0 {
+		return arcs
+	}
+	// The solver will next shift our returned Arcs by (nid % l). Pre-rotate
+	// by (item - nid) % l so the two shifts compose to exactly (item % l).
+	var shift = ((item-int(nid))%l + l) % l
+	if shift == 0 {
+		return arcs
+	}
+	var out = fs.rotationScratch[:l]
+	var n = copy(out, arcs[shift:])
+	copy(out[n:], arcs[:shift])
+	return out
 }
 
 // extractAssignments appends and returns the set of ordered []Assignment
