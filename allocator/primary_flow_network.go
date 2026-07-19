@@ -149,12 +149,31 @@ func newPrimaryFlowNetwork(items, assignments keyspace.KeyValues) *primaryFlowNe
 		for k := range gi.members {
 			memberKeys = append(memberKeys, k)
 		}
-		sort.Strings(memberKeys)
+		sort.Strings(memberKeys) // Deterministic tie-break for the +1 remainder, below.
 
-		var fairShare = pr.Rate(scaleAndRound(gi.itemCount, 1, len(memberKeys)))
-		for _, k := range memberKeys {
+		// Unlike buildGroupMemberArc's use of scaleAndRound (a uniform
+		// ceiling applied to *every* Member), we must give each Member its
+		// own precise share of the remainder, such that caps sum to exactly
+		// |itemCount| -- not more. A uniform ceiling leaves slack (eg
+		// ceil(16/3)=6 given to all 3 Members sums to 18, well over the 16
+		// actually available), and that slack is enough for an already-
+		// skewed distribution (eg 4/6/6) to satisfy every Member's cap
+		// without any Member ever being forced over it. Since Arcs() always
+		// tries an Item's current primary first (for stability -- see
+		// discharge()'s Arc-order shift discussion there), a merely loose
+		// cap provides no pressure to correct that skew: the solver simply
+		// finds this already-acceptable arrangement as *a* maximum flow and
+		// stops, never discovering the more balanced one. A tight cap sum
+		// instead forces every over-full Member to shed its excess primary
+		// Assignments somewhere, actively closing the gap round over round.
+		var floorShare, remainder = gi.itemCount / len(memberKeys), gi.itemCount % len(memberKeys)
+		for i, k := range memberKeys {
+			var cap = floorShare
+			if i < remainder {
+				cap++ // First |remainder| Members (by sorted key) take the +1 share.
+			}
 			groupMemberOf[g+"\x00"+k] = nextID
-			groupMemberCap = append(groupMemberCap, fairShare)
+			groupMemberCap = append(groupMemberCap, pr.Rate(cap))
 			groupMemberKey = append(groupMemberKey, k)
 			nextID++
 		}

@@ -183,6 +183,96 @@ func (s *AllocatorSuite) TestPrimaryFlowNetworkIsStableFixedPoint(c *gc.C) {
 	}
 }
 
+// TestPrimaryFlowNetworkClosesGapUnderLooseCap is a regression test for a
+// production observation: 16 Items (R=2) split evenly enough across 3
+// Members that "group balance" never warned (membership spread <= 1), yet
+// "primary balance" stayed pinned at a 4/6/6 split indefinitely, despite
+// the arc-shift stability fix (see TestPrimaryFlowNetworkIsStableFixedPoint)
+// already being deployed.
+//
+// The culprit: fair share was computed as a uniform *ceiling* applied to
+// every Member (eg ceil(16/3)=6 given to all 3), which sums to 18 -- two
+// more than the 16 primaries actually available. That slack meant a
+// skewed-but-loose-cap-satisfying arrangement like 4/6/6 was already a
+// valid maximum flow the moment the solver considered it, so the "keep
+// current primary" stability bias (needed to prevent the oscillation fixed
+// above) had no pressure to look further, and the network -- though
+// perfectly *stable* -- never closed the gap to a fairer 5/5/6 or 6/5/5.
+//
+// The fix distributes the exact remainder across Members instead (floor
+// share, +1 for only as many Members as the remainder requires), so cap
+// sums to precisely 16, forcing genuine redistribution.
+func (s *AllocatorSuite) TestPrimaryFlowNetworkClosesGapUnderLooseCap(c *gc.C) {
+	var client, ctx = etcdtest.TestClient(), context.Background()
+	defer etcdtest.Cleanup()
+
+	var kv = map[string]string{
+		"/root/members/zone#member-0": `{"R": 100}`,
+		"/root/members/zone#member-1": `{"R": 100}`,
+		"/root/members/zone#member-2": `{"R": 100}`,
+	}
+	// Cycle replica pairs {0,1}, {1,2}, {0,2} across 16 Items, giving a
+	// membership spread of just 1 (11/11/10) -- realistic, already-settled
+	// group balance -- while deliberately skewing *primaries* to a 4/6/6
+	// split that satisfies a loose, uniform ceiling cap of 6 for every
+	// Member without any Member ever exceeding it.
+	for i := 0; i != 16; i++ {
+		var id = fmt.Sprintf("a-topic/part-%02d", i)
+		kv["/root/items/"+id] = `{"R": 2}`
+
+		switch i % 3 {
+		case 0: // Pair {member-0, member-1}: primary always member-1.
+			kv["/root/assign/"+id+"#zone#member-0#1"] = ``
+			kv["/root/assign/"+id+"#zone#member-1#0"] = ``
+		case 1: // Pair {member-1, member-2}: primary always member-2.
+			kv["/root/assign/"+id+"#zone#member-1#1"] = ``
+			kv["/root/assign/"+id+"#zone#member-2#0"] = ``
+		case 2: // Pair {member-0, member-2}: primary member-0 except once.
+			if i == 2 {
+				kv["/root/assign/"+id+"#zone#member-0#1"] = ``
+				kv["/root/assign/"+id+"#zone#member-2#0"] = ``
+			} else {
+				kv["/root/assign/"+id+"#zone#member-0#0"] = ``
+				kv["/root/assign/"+id+"#zone#member-2#1"] = ``
+			}
+		}
+	}
+	for k, v := range kv {
+		var _, err = client.Put(ctx, k, v)
+		c.Assert(err, gc.IsNil)
+	}
+	var ks = NewAllocatorKeySpace("/root", testAllocDecoder{})
+	c.Check(ks.Load(ctx, client, 0), gc.IsNil)
+
+	var items = ks.Prefixed(ks.Root + ItemsPrefix)
+	var assignments = ks.Prefixed(ks.Root + AssignmentsPrefix)
+
+	// Confirm the fixture actually reproduces the reported 4/6/6 split
+	// before asking the network to fix it.
+	var before = make(map[string]int)
+	for i := range assignments {
+		var a = assignmentAt(assignments, i)
+		if a.Slot == 0 {
+			before[memberKeyOf(a)]++
+		}
+	}
+	c.Check(before, gc.DeepEquals, map[string]int{
+		"zone#member-0": 4, "zone#member-1": 6, "zone#member-2": 6,
+	})
+
+	var network = newPrimaryFlowNetwork(items, assignments)
+	var desired = network.extractPrimaries(sparse_push_relabel.FindMaxFlow(network))
+	c.Check(desired, gc.HasLen, 16)
+
+	var counts = summarizeDesiredPrimaries(desired)["a-topic"]
+	var lo, hi = 1 << 30, 0
+	for _, n := range counts {
+		lo, hi = min(lo, n), max(hi, n)
+	}
+	c.Check(hi-lo <= 1, gc.Equals, true,
+		gc.Commentf("expected primary spread <= 1, got counts %v", counts))
+}
+
 func (s *AllocatorSuite) TestConvergeFixtureCases(c *gc.C) {
 	var client, ctx = etcdtest.TestClient(), context.Background()
 	defer etcdtest.Cleanup()

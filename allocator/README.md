@@ -145,3 +145,17 @@ allocator can cycle indefinitely -- see the "current primary" rotation logic
 in `Arcs()`, which counteracts `sparse_push_relabel`'s node-based Arc-order
 shift specifically to guarantee this network is a stable fixed point once
 balanced.
+
+That same "prefer current primary" stability, however, means the
+Group-Member fair-share cap must be *tight* -- summing to exactly the
+group's Item count -- rather than a uniform ceiling applied to every
+Member (as `buildGroupMemberArc` above uses). A uniform ceiling (eg
+`ceil(16/3)=6` given to all 3 Members, summing to 18 against only 16
+available) leaves slack that lets an already-skewed split (eg 4/6/6)
+satisfy every Member's cap without ever exceeding it, so the solver finds
+it as *a* valid maximum flow and stops -- it has no capacity pressure left
+to discover the fairer 5/5/6. `newPrimaryFlowNetwork` instead gives each
+Member its exact floor share, +1 for only as many (deterministically
+chosen) Members as the remainder requires, so the cap sum is exactly the
+Item count and any Member holding more than its precise share is always
+forced to shed the excess somewhere.
