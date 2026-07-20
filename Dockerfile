@@ -1,5 +1,5 @@
 ################################################################################
-# Gazette broker image (SaaS / Ubuntu).
+# Gazette broker image (Ubuntu).
 
 FROM ubuntu:24.04 AS broker
 
@@ -20,9 +20,9 @@ USER gazette
 WORKDIR /home/gazette
 
 ################################################################################
-# Gazette broker image (on-prem / Chainguard).
+# Gazette broker image (Chainguard-based).
 
-FROM cgr.dev/arize.com/custom-gazette-base:latest AS broker-onprem
+FROM cgr.dev/arize.com/custom-gazette-base:latest AS broker-cg-based
 
 ARG TARGETARCH
 
