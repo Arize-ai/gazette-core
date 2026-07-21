@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -64,6 +65,13 @@ type store struct {
 	endpointParams s3.EndpointParameters
 }
 
+// s3AccessPointARNRegex matches an S3 Access Point / Multi-Region Access Point
+// (MRAP) ARN used as a bucket (any partition, any/no region, colon- or
+// slash-separated resource), which must use virtual-hosted (not path-style)
+// addressing. Unlike a bare "arn:aws:s3" prefix check, it also covers the
+// aws-cn and aws-us-gov partitions and rejects strings that merely look ARN-ish.
+var s3AccessPointARNRegex = regexp.MustCompile(`^arn:(aws|aws-cn|aws-us-gov):s3:[a-z0-9-]*:\d{12}:accesspoint[:/][A-Za-z0-9.-]+$`)
+
 // New creates a new S3 Store from the provided URL.
 func New(ep *url.URL) (stores.Store, error) {
 	var args StoreQueryArgs
@@ -116,18 +124,21 @@ func New(ep *url.URL) (stores.Store, error) {
 	// arize fix for sts:AssumeRoleWithWebIdentity, #16048
 	var endpointParams s3.EndpointParameters
 	var client = s3.NewFromConfig(cfg, func(o *s3.Options) {
+		// Enable UseARNRegion unconditionally (SDK will ignore it for non-ARN buckets)
+		// soAccess Point / MRAP ARN buckets route by the ARN's region instead of
+		// depending on the AWS_S3_USE_ARN_REGION env var, whose SDK default is
+		// false. DisableMultiRegionAccessPoints stays at its default (false).
+		o.UseARNRegion = true
+
 		if args.Endpoint != "" {
 			o.BaseEndpoint = aws.String(args.Endpoint)
 			// Path-style addressing is required by S3-compatible
 			// stores (MinIO, Ceph, OCI, etc.), but the AWS SDK rejects it when the bucket is
 			// an Access Point / Multi-Region Access Point (MRAP) ARN with "Path-style
 			// addressing cannot be used with ARN buckets" — those must use virtual-hosted
-			// addressing. Returns false only for ARN-identified buckets.
-			o.UsePathStyle = !strings.HasPrefix(bucket, "arn:aws:s3")
+			// addressing. Disabled only for Access Point / MRAP ARNs.
+			o.UsePathStyle = !s3AccessPointARNRegex.MatchString(bucket)
 		}
-		// Leave o.UseARNRegion = true and o.DisableMultiRegionAccessPoints = false
-		// at v2 defaults so bucket values that are S3 access-point or MRAP
-		// ARNs resolve to their correct endpoint and use SigV4A signing.
 
 		// Snapshot AFTER the v2 SDK's resolve*() functions have populated
 		// o from cfg + env vars + shared config. Bucket is per-call.
