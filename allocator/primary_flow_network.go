@@ -81,6 +81,12 @@ func newPrimaryFlowNetwork(items, assignments keyspace.KeyValues) *primaryFlowNe
 	type groupInfo struct {
 		itemCount int
 		members   map[string]bool
+		// reachable[k] counts the Items of this group for which Member |k|
+		// is a candidate at all (ie currently replicates it), regardless of
+		// Slot. It upper-bounds how many of the group's primaries |k| could
+		// ever hold, and is used to compute a precise, deterministic fair-
+		// share cap per Member -- see groupMemberCaps.
+		reachable map[string]int
 	}
 	var groups = make(map[string]*groupInfo)
 
@@ -102,7 +108,7 @@ func newPrimaryFlowNetwork(items, assignments keyspace.KeyValues) *primaryFlowNe
 		}
 		var gi = groups[group]
 		if gi == nil {
-			gi = &groupInfo{members: make(map[string]bool)}
+			gi = &groupInfo{members: make(map[string]bool), reachable: make(map[string]int)}
 			groups[group] = gi
 		}
 		gi.itemCount++
@@ -113,6 +119,7 @@ func newPrimaryFlowNetwork(items, assignments keyspace.KeyValues) *primaryFlowNe
 			var a = assignmentAt(assignments, j)
 			var key = memberKeyOf(a)
 			gi.members[key] = true
+			gi.reachable[key]++
 			if a.Slot == 0 {
 				primaryKey = key
 			} else {
@@ -149,31 +156,12 @@ func newPrimaryFlowNetwork(items, assignments keyspace.KeyValues) *primaryFlowNe
 		for k := range gi.members {
 			memberKeys = append(memberKeys, k)
 		}
-		sort.Strings(memberKeys) // Deterministic tie-break for the +1 remainder, below.
+		sort.Strings(memberKeys) // Deterministic NodeID assignment & cap tie-break.
+		var caps = groupMemberCaps(gi.itemCount, gi.reachable, memberKeys)
 
-		// Unlike buildGroupMemberArc's use of scaleAndRound (a uniform
-		// ceiling applied to *every* Member), we must give each Member its
-		// own precise share of the remainder, such that caps sum to exactly
-		// |itemCount| -- not more. A uniform ceiling leaves slack (eg
-		// ceil(16/3)=6 given to all 3 Members sums to 18, well over the 16
-		// actually available), and that slack is enough for an already-
-		// skewed distribution (eg 4/6/6) to satisfy every Member's cap
-		// without any Member ever being forced over it. Since Arcs() always
-		// tries an Item's current primary first (for stability -- see
-		// discharge()'s Arc-order shift discussion there), a merely loose
-		// cap provides no pressure to correct that skew: the solver simply
-		// finds this already-acceptable arrangement as *a* maximum flow and
-		// stops, never discovering the more balanced one. A tight cap sum
-		// instead forces every over-full Member to shed its excess primary
-		// Assignments somewhere, actively closing the gap round over round.
-		var floorShare, remainder = gi.itemCount / len(memberKeys), gi.itemCount % len(memberKeys)
-		for i, k := range memberKeys {
-			var cap = floorShare
-			if i < remainder {
-				cap++ // First |remainder| Members (by sorted key) take the +1 share.
-			}
+		for _, k := range memberKeys {
 			groupMemberOf[g+"\x00"+k] = nextID
-			groupMemberCap = append(groupMemberCap, pr.Rate(cap))
+			groupMemberCap = append(groupMemberCap, pr.Rate(caps[k]))
 			groupMemberKey = append(groupMemberKey, k)
 			nextID++
 		}
@@ -196,6 +184,86 @@ func newPrimaryFlowNetwork(items, assignments keyspace.KeyValues) *primaryFlowNe
 		firstItemNodeID:        firstItemNodeID,
 		firstGroupMemberNodeID: firstGroupMemberNodeID,
 	}
+}
+
+// groupMemberCaps computes each Member's precise fair-share cap of a
+// group's |itemCount| primaries, given |reachable| (how many of the
+// group's Items each Member actually replicates, and so could ever be
+// primary for -- see groupInfo.reachable) and the group's |memberKeys|
+// (sorted, for a deterministic tie-break).
+//
+// Unlike buildGroupMemberArc's use of scaleAndRound (a uniform ceiling
+// applied to *every* Member), this must give each Member its own precise
+// share of the remainder, such that caps sum to exactly |itemCount| -- not
+// more. A uniform ceiling leaves slack (eg ceil(16/3)=6 given to all 3
+// Members sums to 18, well over the 16 actually available), and that
+// slack is enough for an already-skewed distribution (eg 4/6/6) to
+// satisfy every Member's cap without any Member ever being forced over
+// it. Since Arcs() always tries an Item's current primary first (for
+// stability -- see discharge()'s Arc-order shift discussion there), a
+// merely loose cap provides no pressure to correct that skew: the solver
+// simply finds this already-acceptable arrangement as *a* maximum flow
+// and stops, never discovering the more balanced one.
+//
+// It's not enough to just divide |itemCount| evenly, either: a Member may
+// structurally be unable to reach an even share, no matter how primaries
+// are chosen, because it simply doesn't replicate enough of the group's
+// Items to begin with (eg a recently-scaled Member still catching up on
+// replica membership). Naively capping every Member at an even share
+// would then leave that Member's shortfall for push/relabel's dynamic,
+// pressure-triggered relaxation (to unbounded capacity) to resolve --
+// which has no deterministic tie-break for *which* of several eligible
+// Members should absorb the overflow, and so can flap between equally
+// valid choices round over round exactly like the arc-shift oscillation
+// above, just one layer higher (across Members instead of within a single
+// Item's own candidates).
+//
+// So instead, this "water-fills" the exact remainder across Members
+// biased by their reachability: any Member whose reachability falls short
+// of an even split of the *remaining* demand is capped at its reachable
+// count (it structurally can't be pushed any higher), and its shortfall
+// is folded back into the pool redistributed evenly (floor share, +1 for
+// only as many Members as the new remainder requires) among the Members
+// still able to accept more. This repeats until every remaining Member's
+// share is within its means, at which point the result is a pure
+// function of input state -- no relaxation, and no round-over-round
+// ambiguity, is needed to reach it.
+func groupMemberCaps(itemCount int, reachable map[string]int, memberKeys []string) map[string]int {
+	var caps = make(map[string]int, len(memberKeys))
+	var remaining = append([]string(nil), memberKeys...) // Already sorted by caller.
+	var demand = itemCount
+
+	for len(remaining) != 0 {
+		var floorShare, remainder = demand / len(remaining), demand % len(remaining)
+		var unconstrained []string // Members able to meet this round's even share.
+
+		for i, k := range remaining {
+			var share = floorShare
+			if i < remainder {
+				share++
+			}
+			if reachable[k] < share {
+				caps[k] = reachable[k] // Structurally capped: shed to the remaining pool.
+				demand -= reachable[k]
+			} else {
+				unconstrained = append(unconstrained, k)
+			}
+		}
+		if len(unconstrained) == len(remaining) {
+			// No Member was reachability-constrained this round: finalize
+			// the even split just computed and we're done.
+			for i, k := range remaining {
+				var share = floorShare
+				if i < remainder {
+					share++
+				}
+				caps[k] = share
+			}
+			break
+		}
+		remaining = unconstrained
+	}
+	return caps
 }
 
 func (fn *primaryFlowNetwork) Nodes() int {

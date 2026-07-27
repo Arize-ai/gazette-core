@@ -154,8 +154,23 @@ Member (as `buildGroupMemberArc` above uses). A uniform ceiling (eg
 available) leaves slack that lets an already-skewed split (eg 4/6/6)
 satisfy every Member's cap without ever exceeding it, so the solver finds
 it as *a* valid maximum flow and stops -- it has no capacity pressure left
-to discover the fairer 5/5/6. `newPrimaryFlowNetwork` instead gives each
-Member its exact floor share, +1 for only as many (deterministically
-chosen) Members as the remainder requires, so the cap sum is exactly the
-Item count and any Member holding more than its precise share is always
-forced to shed the excess somewhere.
+to discover the fairer 5/5/6.
+
+A precise even split isn't always achievable, though: a Member may
+structurally be unable to reach its share no matter how primaries are
+chosen, simply because it doesn't replicate enough of the group's Items
+to begin with (eg a recently-scaled Member still catching up on replica
+membership elsewhere). `groupMemberCaps` accounts for this by
+"water-filling" each Member's cap against its actual reachability (how
+many of the group's Items it replicates at all -- an upper bound on how
+many it could ever be primary for): any Member short of an even split of
+the *remaining* demand is capped at its reachable count, and its
+shortfall folds back into the pool redistributed evenly among the
+Members still able to accept more, repeating until stable. This -- and
+not push/relabel's dynamic, pressure-triggered relaxation to unbounded
+capacity -- is what resolves an unreachable Member's shortfall, since
+that relaxation has no deterministic tie-break for *which* of several
+eligible Members should absorb the overflow, and previously could flap
+between equally valid choices round over round, exactly like the arc-shift
+oscillation above but one layer higher (across Members instead of within
+a single Item's own candidates).

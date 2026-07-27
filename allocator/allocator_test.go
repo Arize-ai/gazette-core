@@ -273,6 +273,96 @@ func (s *AllocatorSuite) TestPrimaryFlowNetworkClosesGapUnderLooseCap(c *gc.C) {
 		gc.Commentf("expected primary spread <= 1, got counts %v", counts))
 }
 
+// TestPrimaryFlowNetworkStableUnderReachabilityShortfall is a regression
+// test for a third oscillation source, seen in production with 16 Items
+// (R=3, one replica per zone) spread across 6 Members in 3 zones. One
+// Member (analogous to a recently-scaled zone-mate that hasn't yet
+// received its fair share of *replica* membership) structurally replicates
+// very few Items, and so can never reach its nominal fair-share cap no
+// matter how primaries are chosen -- that's an upstream replica-membership
+// concern, not something primary selection can fix. But the *shortfall* it
+// leaves behind must land somewhere, and the previous fix (a precise,
+// evenly-divided cap per Member) has no further guidance for how to
+// redistribute demand that a Member structurally can't absorb: it falls
+// back to push/relabel's dynamic, pressure-triggered relaxation to
+// *unbounded* capacity, which has no deterministic tie-break for *which*
+// of several equally-eligible Members should absorb the overflow --
+// producing the same class of round-over-round flapping the earlier arc-
+// shift fix addressed, just one layer higher (across Members instead of
+// within a single Item's own candidates).
+func (s *AllocatorSuite) TestPrimaryFlowNetworkStableUnderReachabilityShortfall(c *gc.C) {
+	var client, ctx = etcdtest.TestClient(), context.Background()
+	defer etcdtest.Cleanup()
+
+	var kv = map[string]string{
+		"/root/members/us-east-1c#tc2rb": `{"R": 100}`,
+		"/root/members/us-east-1c#vgmpf": `{"R": 100}`,
+		"/root/members/us-east-1d#b52b8": `{"R": 100}`,
+		"/root/members/us-east-1d#m956h": `{"R": 100}`,
+		"/root/members/us-east-1d#t9wdw": `{"R": 100}`,
+		"/root/members/us-east-1e#hbkq2": `{"R": 100}`,
+	}
+	// One replica per zone (R=3): zone 1c alternates tc2rb/vgmpf, but
+	// vgmpf only actually lands on a single Item (i == 15) -- mirroring a
+	// Member that structurally can't reach any reasonable fair share.
+	// Zone 1d round-robins its three Members evenly. Zone 1e has only one
+	// Member (hbkq2), which necessarily replicates every Item.
+	var zoneD = []string{"b52b8", "m956h", "t9wdw"}
+	for i := 0; i != 16; i++ {
+		var id = fmt.Sprintf("records/part-%02d", i)
+		kv["/root/items/"+id] = `{"R": 3}`
+
+		var zoneCMember = "tc2rb"
+		if i == 15 {
+			zoneCMember = "vgmpf"
+		}
+		// Arbitrary initial primary: whichever zone-1d Member replicates it.
+		kv["/root/assign/"+id+"#us-east-1c#"+zoneCMember+"#1"] = ``
+		kv["/root/assign/"+id+"#us-east-1d#"+zoneD[i%len(zoneD)]+"#0"] = ``
+		kv["/root/assign/"+id+"#us-east-1e#hbkq2#2"] = ``
+	}
+	for k, v := range kv {
+		var _, err = client.Put(ctx, k, v)
+		c.Assert(err, gc.IsNil)
+	}
+	var ks = NewAllocatorKeySpace("/root", testAllocDecoder{})
+	c.Check(ks.Load(ctx, client, 0), gc.IsNil)
+
+	var items = ks.Prefixed(ks.Root + ItemsPrefix)
+	var assignments = ks.Prefixed(ks.Root + AssignmentsPrefix)
+
+	var last map[string]string
+	for round := 0; round != 8; round++ {
+		var network = newPrimaryFlowNetwork(items, assignments)
+		var next = network.extractPrimaries(sparse_push_relabel.FindMaxFlow(network))
+		c.Check(next, gc.HasLen, 16)
+
+		if round > 0 {
+			c.Check(next, gc.DeepEquals, last,
+				gc.Commentf("primary selection changed on round %d despite unchanged fair-share pressure", round))
+		}
+		last = next
+
+		for i := range assignments {
+			var a = assignmentAt(assignments, i)
+			if a.Slot == 0 && next[a.ItemID] != memberKeyOf(a) {
+				a.Slot = 1
+			} else if a.Slot != 0 && next[a.ItemID] == memberKeyOf(a) {
+				a.Slot = 0
+			}
+			assignments[i].Decoded = a
+		}
+	}
+
+	var counts = summarizeDesiredPrimaries(last)["records"]
+	var lo, hi = 1 << 30, 0
+	for _, n := range counts {
+		lo, hi = min(lo, n), max(hi, n)
+	}
+	c.Check(hi-lo <= 2, gc.Equals, true,
+		gc.Commentf("expected primary spread <= 2 given vgmpf's structural shortfall, got counts %v", counts))
+}
+
 func (s *AllocatorSuite) TestConvergeFixtureCases(c *gc.C) {
 	var client, ctx = etcdtest.TestClient(), context.Background()
 	defer etcdtest.Cleanup()
