@@ -98,7 +98,8 @@ func parseFragmentStoreURL(raw string) (*url.URL, error) {
 	// Separate the query string, if present.
 	var rest = raw[len("s3://"):]
 	var rawQuery string
-	if i := strings.IndexByte(rest, '?'); i != -1 {
+	var i = strings.IndexByte(rest, '?')
+	if i != -1 {
 		rest, rawQuery = rest[:i], rest[i+1:]
 	}
 
@@ -112,7 +113,8 @@ func parseFragmentStoreURL(raw string) (*url.URL, error) {
 
 	var nameStart = ap + len(apMarker)
 	var bucket, path string
-	if slash := strings.IndexByte(rest[nameStart:], '/'); slash == -1 {
+	var slash = strings.IndexByte(rest[nameStart:], '/')
+	if slash == -1 {
 		bucket, path = rest, ""
 	} else {
 		var boundary = nameStart + slash
