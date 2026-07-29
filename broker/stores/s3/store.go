@@ -66,11 +66,9 @@ type store struct {
 }
 
 // s3AccessPointARNRegex matches an S3 Access Point / Multi-Region Access Point
-// (MRAP) ARN used as a bucket (any partition, any/no region, colon- or
-// slash-separated resource), which must use virtual-hosted (not path-style)
-// addressing. Unlike a bare "arn:aws:s3" prefix check, it also covers the
-// aws-cn and aws-us-gov partitions and rejects strings that merely look ARN-ish.
-var s3AccessPointARNRegex = regexp.MustCompile(`^arn:(aws|aws-cn|aws-us-gov):s3:[a-z0-9-]*:\d{12}:accesspoint[:/][A-Za-z0-9.-]+$`)
+// Example pattern: arn:aws:s3::{account-id}:accesspoint/{mrap-alias}.mrap
+// Partition can be aws (or aws-cn / aws-us-gov depending on the environment)
+var s3AccessPointARNRegex = regexp.MustCompile(`^arn:(aws|aws-cn|aws-us-gov):s3:[a-z0-9-]*:\d{12}:accesspoint/[A-Za-z0-9.-]+$`)
 
 // New creates a new S3 Store from the provided URL.
 func New(ep *url.URL) (stores.Store, error) {

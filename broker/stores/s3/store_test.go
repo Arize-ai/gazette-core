@@ -85,7 +85,7 @@ func TestS3AccessPointARNRegex(t *testing.T) {
 		{"plain bucket", "my-bucket", false},
 		{"minio style bucket", "some.compatible-store", false},
 		{"aws mrap arn slash", "arn:aws:s3::123456789012:accesspoint/my-alias.mrap", true},
-		{"aws mrap arn colon", "arn:aws:s3::123456789012:accesspoint:my-alias.mrap", true},
+		{"aws mrap arn colon (rejected; parser only handles slash form)", "arn:aws:s3::123456789012:accesspoint:my-alias.mrap", false},
 		{"aws regional access point arn", "arn:aws:s3:us-west-2:123456789012:accesspoint/my-ap", true},
 		{"aws-cn mrap arn", "arn:aws-cn:s3::123456789012:accesspoint/my-alias.mrap", true},
 		{"aws-us-gov mrap arn", "arn:aws-us-gov:s3::123456789012:accesspoint/my-alias.mrap", true},
