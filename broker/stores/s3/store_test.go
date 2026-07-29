@@ -73,3 +73,27 @@ func TestS3StoreIsAuthError(t *testing.T) {
 		})
 	}
 }
+
+// TestS3AccessPointARNRegex verifies that path-style addressing is disabled only
+// for S3 Access Point / MRAP ARN buckets, across all AWS partitions.
+func TestS3AccessPointARNRegex(t *testing.T) {
+	tests := []struct {
+		name   string
+		bucket string
+		want   bool
+	}{
+		{"plain bucket", "my-bucket", false},
+		{"minio style bucket", "some.compatible-store", false},
+		{"aws mrap arn slash", "arn:aws:s3::123456789012:accesspoint/my-alias.mrap", true},
+		{"aws mrap arn colon (rejected; parser only handles slash form)", "arn:aws:s3::123456789012:accesspoint:my-alias.mrap", false},
+		{"aws regional access point arn", "arn:aws:s3:us-west-2:123456789012:accesspoint/my-ap", true},
+		{"aws-cn mrap arn", "arn:aws-cn:s3::123456789012:accesspoint/my-alias.mrap", true},
+		{"aws-us-gov mrap arn", "arn:aws-us-gov:s3::123456789012:accesspoint/my-alias.mrap", true},
+		{"bucket that merely looks arn-ish", "arn:aws:s3-not-an-accesspoint", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, s3AccessPointARNRegex.MatchString(tc.bucket))
+		})
+	}
+}
