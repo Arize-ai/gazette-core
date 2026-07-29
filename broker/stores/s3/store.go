@@ -123,7 +123,7 @@ func New(ep *url.URL) (stores.Store, error) {
 	var endpointParams s3.EndpointParameters
 	var client = s3.NewFromConfig(cfg, func(o *s3.Options) {
 		// Enable UseARNRegion unconditionally (SDK will ignore it for non-ARN buckets)
-		// soAccess Point / MRAP ARN buckets route by the ARN's region instead of
+		// so Access Point / MRAP ARN buckets route by the ARN's region instead of
 		// depending on the AWS_S3_USE_ARN_REGION env var, whose SDK default is
 		// false. DisableMultiRegionAccessPoints stays at its default (false).
 		o.UseARNRegion = true
