@@ -48,6 +48,9 @@ func InitDiagnosticsAndRecover(cfg DiagnosticsConfig) func() {
 	http.HandleFunc("/debug/ready", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
+	// Track capacity of the filesystem backing os.TempDir() (typically /tmp),
+	// including space held by open-but-unlinked journal spool files.
+	RegisterTmpFSMetrics()
 	// Serve Prometheus metrics at /debug/metrics.
 	http.Handle("/debug/metrics", promhttp.Handler())
 
