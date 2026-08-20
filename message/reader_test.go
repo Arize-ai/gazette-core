@@ -2,6 +2,7 @@ package message
 
 import (
 	"context"
+	"errors"
 	"io"
 	"testing"
 
@@ -209,4 +210,48 @@ func TestReadUncommittedIterReadErrorCases(t *testing.T) {
 	r.spec, r.unmarshal = spec, framing.NewUnmarshalFunc(r.br)
 	_, err = r.Next()
 	require.EqualError(t, err, "framing.Unmarshal(offset 1000): unexpected EOF")
+}
+
+func TestReadUncommittedIterOffsetExceedsWriteHead(t *testing.T) {
+	var broker = teststub.NewBroker(t)
+	defer broker.Cleanup()
+
+	var ctx = context.Background()
+	var spec = &pb.JournalSpec{Name: "a/journal"}
+	var framing, _ = FramingByContentType(labels.ContentType_JSONLines)
+
+	// The broker reports that the read offset is ahead of the write head, as it
+	// does after `gazctl journals reset-head` moves the head backward.
+	go func() {
+		_ = <-broker.ReadReqCh // Read request.
+
+		broker.ReadRespCh <- pb.ReadResponse{
+			Status:    pb.Status_OFFSET_NOT_YET_AVAILABLE,
+			Offset:    2000,
+			WriteHead: 500,
+		}
+		broker.WriteLoopErrCh <- nil // EOF.
+	}()
+
+	var rr = client.NewRetryReader(ctx, broker.Client(), pb.ReadRequest{
+		Journal: "a/journal",
+		Offset:  2000,
+		Block:   true,
+	})
+	var r = NewReadUncommittedIter(rr, newTestMsg)
+	r.spec, r.unmarshal = spec, framing.NewUnmarshalFunc(r.br) // Set fixtures without running init().
+
+	var _, err = r.Next()
+
+	// Expect the regression is surfaced as a typed error the consumer can act
+	// on, carrying the write head to restart from.
+	var offsetErr *client.OffsetExceedsWriteHeadError
+	require.True(t, errors.As(err, &offsetErr))
+	require.Equal(t, pb.Journal("a/journal"), offsetErr.Journal)
+	require.Equal(t, int64(500), offsetErr.WriteHead)
+	require.True(t, errors.Is(err, client.ErrOffsetExceedsWriteHead))
+
+	// And that it's not mis-attributed to a framing failure, which is what
+	// happens if the error is matched by equality rather than errors.As.
+	require.EqualError(t, err, "read offset exceeds journal write head (a/journal at 500)")
 }

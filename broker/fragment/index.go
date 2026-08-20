@@ -18,6 +18,18 @@ const (
 	offsetJumpAgeThreshold = 6 * time.Hour
 )
 
+// writeHeadRegressionGrace bounds how long Query waits for the index to catch up
+// to a read offset which is ahead of the write head, before concluding that the
+// write head regressed (eg, after `gazctl journals reset-head`).
+//
+// Such a read is ambiguous. It's either a genuine regression, or it's the
+// hand-off race described in Query below, where a newly-assigned broker isn't
+// yet aware of a Fragment which is being uploaded or which is held in a peer's
+// Spool. The race resolves within a journal pulse (see pulseDaemon), whereas a
+// regression is permanent and admin-initiated, so waiting distinguishes the two
+// at the cost of a bounded delay on the rare regression path.
+var writeHeadRegressionGrace = 5 * time.Second
+
 // Index maintains a queryable index of local and remote journal Fragments.
 type Index struct {
 	ctx            context.Context // Context over the lifetime of the Index.
@@ -50,6 +62,18 @@ func (fi *Index) Query(ctx context.Context, req *pb.ReadRequest) (*pb.ReadRespon
 	if resp.Offset == -1 {
 		resp.Offset = fi.set.EndOffset()
 	}
+
+	// Grace timer, started lazily upon first observing a read offset which is
+	// ahead of the write head. See writeHeadRegressionGrace.
+	var graceTimer *time.Timer
+	var graceCh <-chan time.Time
+	var graceExpired bool
+
+	defer func() {
+		if graceTimer != nil {
+			graceTimer.Stop()
+		}
+	}()
 
 	for {
 		var ind, found = fi.set.LongestOverlappingFragment(resp.Offset)
@@ -128,18 +152,35 @@ func (fi *Index) Query(ctx context.Context, req *pb.ReadRequest) (*pb.ReadRespon
 		// the case is also detected when the write head is zero, e.g. after a
 		// reset of a journal whose fragments were all lost. After the first
 		// refresh EndOffset() reflects the journal's true extent, so a zero
-		// EndOffset() genuinely means the head is at zero. The tradeoff is a
-		// transient false positive during failover of a journal with no
-		// persisted fragments and a live spool still re-establishing past
-		// resp.Offset: the consumer restarts at the (zero) write head and
-		// reprocesses, which is correctness-preserving (see reset-shard.md).
+		// EndOffset() genuinely means the head is at zero.
+		//
+		// We further require that the condition persist for
+		// writeHeadRegressionGrace. Otherwise we would break the hand-off race
+		// described above: a broker which is newly assigned to this journal, and
+		// hasn't yet learned of a Fragment being uploaded or held in a peer's
+		// Spool, must keep blocking rather than report a spurious regression.
 		if refreshed && resp.Offset > fi.set.EndOffset() {
-			resp.Status = pb.Status_OFFSET_NOT_YET_AVAILABLE
-			resp.WriteHead = fi.set.EndOffset()
+			if graceExpired {
+				resp.Status = pb.Status_OFFSET_NOT_YET_AVAILABLE
+				resp.WriteHead = fi.set.EndOffset()
 
-			addTrace(ctx, "Index.Query(%s) => %s (read offset %d exceeds write head %d)",
-				req, resp, resp.Offset, fi.set.EndOffset())
-			return resp, nil, nil
+				addTrace(ctx, "Index.Query(%s) => %s (read offset %d exceeds write head %d)",
+					req, resp, resp.Offset, fi.set.EndOffset())
+				return resp, nil, nil
+			}
+			if graceTimer == nil {
+				graceTimer = time.NewTimer(writeHeadRegressionGrace)
+				graceCh = graceTimer.C
+
+				addTrace(ctx, "Index.Query(%s) => read offset %d exceeds write head %d; awaiting grace period",
+					req, resp.Offset, fi.set.EndOffset())
+			}
+		} else if graceTimer != nil {
+			// The index caught up: this was the hand-off race and not a
+			// regression. Discard the timer, so that a regression observed later
+			// in this same Query is granted a full grace period of its own.
+			graceTimer.Stop()
+			graceTimer, graceCh, graceExpired = nil, nil, false
 		}
 
 		addTrace(ctx, " ... stalled in Index.Query(%s)", req)
@@ -150,6 +191,8 @@ func (fi *Index) Query(ctx context.Context, req *pb.ReadRequest) (*pb.ReadRespon
 		select {
 		case <-condCh:
 			// Pass.
+		case <-graceCh:
+			graceExpired = true
 		case <-ctx.Done():
 			err = ctx.Err()
 		case <-fi.ctx.Done():
