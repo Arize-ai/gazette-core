@@ -13,6 +13,9 @@ The module is organized around four main concerns:
 ### Reading
 - **Reader**: Basic `io.Reader` adapter for single Read RPCs
 - **RetryReader**: Resilient reader that automatically restarts Read RPCs on failure
+  - Exception: it returns `OffsetExceedsWriteHeadError` rather than retrying when the
+    read offset is ahead of the journal's write head, meaning the head moved backward.
+    See "Write Head Regression" in `broker/fragment`.
 
 ### Writing  
 - **Appender**: Direct `io.WriteCloser` adapter for Append RPCs with linearizable semantics

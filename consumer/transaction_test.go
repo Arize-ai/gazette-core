@@ -33,7 +33,7 @@ func TestTxnPriorSyncsThenMinDurElapses(t *testing.T) {
 		txn            = transaction{}
 		store          = shard.store.(*JSONFileStore)
 	)
-	startReadingMessages(shard, cp, msgCh)
+	startReadingMessages(shard.ctx, shard, cp, msgCh)
 	txnInit(shard, &txn, &prior, msgCh, timer.txnTimer)
 
 	require.False(t, prior.prepareDoneAt.IsZero())
@@ -126,7 +126,7 @@ func TestTxnMinDurElapsesThenPriorSyncs(t *testing.T) {
 		txn            = transaction{}
 		store          = shard.store.(*JSONFileStore)
 	)
-	startReadingMessages(shard, cp, msgCh)
+	startReadingMessages(shard.ctx, shard, cp, msgCh)
 	txnInit(shard, &txn, &prior, msgCh, timer.txnTimer)
 
 	// Initial message opens the txn.
@@ -209,7 +209,7 @@ func TestTxnMaxDurElapsesThenPriorSyncs(t *testing.T) {
 		txn            = transaction{}
 		store          = shard.store.(*JSONFileStore)
 	)
-	startReadingMessages(shard, cp, msgCh)
+	startReadingMessages(shard.ctx, shard, cp, msgCh)
 	txnInit(shard, &txn, &prior, msgCh, timer.txnTimer)
 
 	// Initial message opens the txn.
@@ -286,7 +286,7 @@ func TestTxnDoesntStartUntilFirstACK(t *testing.T) {
 		txn            = transaction{}
 		store          = shard.store.(*JSONFileStore)
 	)
-	startReadingMessages(shard, cp, msgCh)
+	startReadingMessages(shard.ctx, shard, cp, msgCh)
 	txnInit(shard, &txn, &prior, msgCh, timer.txnTimer)
 
 	// |prior| commits and ACKs.
@@ -377,7 +377,7 @@ func TestTxnReadChannelDrain(t *testing.T) {
 		txn            = transaction{}
 		store          = shard.store.(*JSONFileStore)
 	)
-	startReadingMessages(shard, cp, msgCh)
+	startReadingMessages(shard.ctx, shard, cp, msgCh)
 	txnInit(shard, &txn, &prior, altMsgCh, timer.txnTimer)
 
 	// Initial message opens the txn.
@@ -462,7 +462,7 @@ func TestIdleTxnUpdatesProgressOnDuplicateACKs(t *testing.T) {
 		},
 		12,
 	)
-	startReadingMessages(shard, cp, msgCh)
+	startReadingMessages(shard.ctx, shard, cp, msgCh)
 	txnInit(shard, &txn, &prior, msgCh, timer.txnTimer)
 
 	// A duplicate message is received, which does not begin a transaction.
@@ -516,7 +516,7 @@ func TestTxnMaxDurWithinDequeueSequence(t *testing.T) {
 		txn            = transaction{}
 		_              = shard.store.(*JSONFileStore)
 	)
-	startReadingMessages(shard, cp, msgCh)
+	startReadingMessages(shard.ctx, shard, cp, msgCh)
 	txnInit(shard, &txn, &prior, msgCh, timer.txnTimer)
 
 	// Write a committed message sequence which opens the stream.
@@ -587,7 +587,7 @@ func TestAppDeferWithinDequeueSequence(t *testing.T) {
 		txn            = transaction{}
 		_              = shard.store.(*JSONFileStore)
 	)
-	startReadingMessages(shard, cp, msgCh)
+	startReadingMessages(shard.ctx, shard, cp, msgCh)
 	txnInit(shard, &txn, &prior, msgCh, timer.txnTimer)
 
 	// Write a committed message sequence which opens the stream.
@@ -681,7 +681,7 @@ func TestRunTxnsUpdatesRecordedHints(t *testing.T) {
 		msgCh   = make(chan EnvelopeOrError, 1)
 		hintsCh = make(chan time.Time, 1)
 	)
-	startReadingMessages(shard, cp, msgCh)
+	startReadingMessages(shard.ctx, shard, cp, msgCh)
 
 	go func() {
 		require.True(t, errors.Is(runTransactions(shard, cp, msgCh, hintsCh), context.Canceled))
@@ -707,7 +707,7 @@ func TestRunTxnsAppErrorCases(t *testing.T) {
 		cp    = playAndComplete(t, shard)
 		msgCh = make(chan EnvelopeOrError, 1)
 	)
-	startReadingMessages(shard, cp, msgCh)
+	startReadingMessages(shard.ctx, shard, cp, msgCh)
 
 	var cases = []struct {
 		fn           func()

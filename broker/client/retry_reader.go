@@ -94,6 +94,20 @@ func (rr *RetryReader) Read(p []byte) (n int, err error) {
 		case context.DeadlineExceeded, context.Canceled:
 			return // Surface to caller.
 		case ErrOffsetNotYetAvailable:
+			if rr.Reader.Request.Offset > rr.Reader.Response.WriteHead {
+				// Read offset is ahead of the journal's write head. This
+				// indicates the write head moved backward (e.g., after
+				// reset-head). We do not require WriteHead > 0 so that a reset
+				// to a zero write head (a journal whose fragments were all lost)
+				// is also surfaced rather than retried endlessly. Surface to the
+				// consumer so it can restart at the write head to maintain
+				// framing alignment.
+				err = &OffsetExceedsWriteHeadError{
+					Journal:   rr.Reader.Request.Journal,
+					WriteHead: rr.Reader.Response.WriteHead,
+				}
+				return
+			}
 			if rr.Reader.Request.Block {
 				// |Block| was set after a non-blocking reader was started. Restart in blocking mode.
 				squelch = true
@@ -180,6 +194,9 @@ func (rr *RetryReader) Seek(offset int64, whence int) (int64, error) {
 
 // AdjustedOffset delegates to the current Reader's AdjustedOffset.
 func (rr *RetryReader) AdjustedOffset(br *bufio.Reader) int64 { return rr.Reader.AdjustedOffset(br) }
+
+// WriteHead returns the write head from the most recent ReadResponse.
+func (rr *RetryReader) WriteHead() int64 { return rr.Reader.Response.WriteHead }
 
 // AdjustedSeek sets the offset for the next Read, accounting for buffered data and,
 // where possible, accomplishing the AdjustedSeek by discarding from the bufio.Reader.
