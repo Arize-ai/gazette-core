@@ -20,6 +20,13 @@ type AllocateArgs struct {
 	Etcd *clientv3.Client
 	// Allocator state, which is derived from a Watched KeySpace.
 	State *State
+	// MaxPrimarySwapsPerRound bounds the number of primary Assignments which
+	// may be handed off within a balance group in one convergence round (see
+	// ItemGroupValue). Zero -- the default -- disables primary balancing
+	// entirely, leaving allocation identical to a build without the feature.
+	// A handoff tears down and re-establishes an Item's replication pipeline,
+	// so a small value corrects accumulated skew gradually.
+	MaxPrimarySwapsPerRound int
 	// TestHook is an optional testing hook, invoked after each convergence round.
 	TestHook func(round int, isIdle bool)
 }
@@ -105,9 +112,15 @@ func Allocate(args AllocateArgs) error {
 			var txn = newBatchedTxn(ctx, args.Etcd,
 				modRevisionUnchanged(state.Members[state.LocalMemberInd]))
 
+			// Determine primary handoffs which improve balance within a
+			// balance group. This does no work at all -- and allocates
+			// nothing -- when balancing is off or every group is already
+			// fair, which is the steady state of a healthy cluster.
+			var swaps = rebalanceGroupPrimaries(state, args.MaxPrimarySwapsPerRound)
+
 			// Converge the current state towards |desired|.
 			var err error
-			if err = converge(txn, state, desired); err == nil {
+			if err = converge(txn, state, desired, args.MaxPrimarySwapsPerRound > 0, swaps); err == nil {
 				err = txn.Flush()
 			}
 
@@ -123,9 +136,7 @@ func Allocate(args AllocateArgs) error {
 			} else {
 				allocatorConvergeTotal.Inc()
 
-				allocatorNumMembers.Set(float64(len(state.Members)))
-				allocatorNumItems.Set(float64(len(state.Items)))
-				allocatorNumItemSlots.Set(float64(state.ItemSlots))
+				setStateMetrics(state)
 
 				if args.TestHook != nil {
 					args.TestHook(round, txn.Revision() == 0)
@@ -146,8 +157,10 @@ func Allocate(args AllocateArgs) error {
 // not cause any Item or Member replication constraints to be violated (eg, by
 // leaving an Item with too few consistent replicas, or a Member with too many
 // assigned Items).
-func converge(txn checkpointTxn, as *State, desired []Assignment) error {
-	var itemState = itemState{global: as}
+func converge(txn checkpointTxn, as *State, desired []Assignment,
+	balancePrimaries bool, swaps map[string]memberID) error {
+
+	var itemState = itemState{global: as, balancePrimaries: balancePrimaries}
 	var lastCRE int // cur.RightEnd of the previous iteration.
 
 	// Walk Items, joined with their current Assignments. Simultaneously walk
@@ -174,6 +187,8 @@ func converge(txn checkpointTxn, as *State, desired []Assignment) error {
 
 		// Initialize |itemState|, computing the delta of current and |desired| Item Assignments.
 		itemState.init(cur.Left, as.Assignments[cur.RightBegin:cur.RightEnd], desired[:limit])
+		itemState.desiredPrimary = swaps[itemAt(as.Items, cur.Left).ID]
+
 		if err := itemState.constrainAndBuildOps(txn); err != nil {
 			return err
 		}
@@ -438,3 +453,27 @@ func (b *batchedTxn) debugLogTxn(response *clientv3.TxnResponse, err error) {
 // configuration at runtime with --max-txn-ops. We assume the default and will
 // error if a smaller value is used.
 var maxTxnOps = 128
+
+// setStateMetrics publishes gauges derived from the current State, once per
+// applied converge round. The *Vec gauges are reset first so that departed
+// Members do not linger as stale series.
+func setStateMetrics(s *State) {
+	allocatorNumMembers.Set(float64(len(s.Members)))
+	allocatorNumItems.Set(float64(len(s.Items)))
+	allocatorNumItemSlots.Set(float64(s.ItemSlots))
+	allocatorNumGroups.Set(float64(len(s.GroupNames) - 1))
+	allocatorGroupPrimarySpreadMax.Set(float64(s.MaxGroupPrimarySpread))
+	allocatorGroupPrimaryShareMax.Set(s.maxGroupPrimaryShare())
+
+	allocatorMemberAssignments.Reset()
+	allocatorMemberPrimaries.Reset()
+
+	for m := range s.Members {
+		var member = memberAt(s.Members, m)
+
+		allocatorMemberAssignments.WithLabelValues(member.Zone, member.Suffix).
+			Set(float64(s.MemberTotalCount[m]))
+		allocatorMemberPrimaries.WithLabelValues(member.Zone, member.Suffix).
+			Set(float64(s.MemberPrimaryCount[m]))
+	}
+}

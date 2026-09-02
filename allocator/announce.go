@@ -95,6 +95,9 @@ type SessionArgs struct {
 	LeaseTTL time.Duration
 	SignalCh <-chan os.Signal
 	TestHook func(round int, isIdle bool)
+	// MaxPrimarySwapsPerRound is passed through to AllocateArgs. Zero disables
+	// primary balancing.
+	MaxPrimarySwapsPerRound int
 }
 
 // StartSession starts an allocator session. It:
@@ -154,10 +157,11 @@ func StartSession(args SessionArgs) error {
 		defer args.Tasks.Cancel()
 
 		var err = Allocate(AllocateArgs{
-			Context:  args.Tasks.Context(),
-			Etcd:     args.Etcd,
-			State:    args.State,
-			TestHook: args.TestHook,
+			Context:                 args.Tasks.Context(),
+			Etcd:                    args.Etcd,
+			State:                   args.State,
+			MaxPrimarySwapsPerRound: args.MaxPrimarySwapsPerRound,
+			TestHook:                args.TestHook,
 		})
 		if errors.Cause(err) == context.Canceled {
 			err = nil

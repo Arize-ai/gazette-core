@@ -1029,6 +1029,15 @@ func keys(kv keyspace.KeyValues) []string {
 }
 
 func serveUntilIdle(t *testing.T, ctx context.Context, client *clientv3.Client, ks *keyspace.KeySpace, when string) int {
+	return serveUntilIdleWithPrimaryBalance(t, ctx, client, ks, when, 0, nil)
+}
+
+// serveUntilIdleWithPrimaryBalance is serveUntilIdle with primary balancing
+// enabled at the given per-round handoff budget. A budget of zero disables it,
+// which is what every other scenario uses. |perRound|, if set, is invoked after
+// every convergence round -- including rounds which are not idle, where an Item
+// may be simultaneously gaining or losing replicas.
+func serveUntilIdleWithPrimaryBalance(t *testing.T, ctx context.Context, client *clientv3.Client, ks *keyspace.KeySpace, when string, maxSwaps int, perRound func()) int {
 	// Pluck out the key of the current Member leader. We'll assume its identity.
 	var resp, err = client.Get(ctx, ks.Root+MembersPrefix,
 		clientv3.WithPrefix(),
@@ -1046,10 +1055,14 @@ func serveUntilIdle(t *testing.T, ctx context.Context, client *clientv3.Client, 
 
 	// Create and serve an Allocator which will |cancel| when it becomes idle.
 	require.Equal(t, Allocate(AllocateArgs{
-		Context: ctx,
-		Etcd:    client,
-		State:   state,
+		Context:                 ctx,
+		Etcd:                    client,
+		State:                   state,
+		MaxPrimarySwapsPerRound: maxSwaps,
 		TestHook: func(round int, idle bool) {
+			if perRound != nil {
+				perRound()
+			}
 			if !idle {
 				return
 			} else if err := markAllConsistent(ctx, client, ks, when); err == nil {

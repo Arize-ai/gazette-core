@@ -46,4 +46,28 @@ var (
 		Name: "gazette_allocator_members",
 		Help: "Number of members known to the allocator.",
 	})
+	allocatorMemberAssignments = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "gazette_allocator_member_assignments",
+		Help: "Number of assignments of any slot held by each member.",
+	}, []string{"zone", "suffix"})
+	allocatorMemberPrimaries = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "gazette_allocator_member_primaries",
+		Help: "Number of primary (slot zero) assignments held by each member.",
+	}, []string{"zone", "suffix"})
+	allocatorNumGroups = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "gazette_allocator_balance_groups",
+		Help: "Number of balance groups declared by items.",
+	})
+	allocatorGroupPrimarySpreadMax = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "gazette_allocator_balance_group_primary_spread_max",
+		Help: "Largest difference in primary assignments of one balance group held by any member replicating part of it. One or less is fair.",
+	})
+	allocatorGroupPrimaryShareMax = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "gazette_allocator_balance_group_primary_share_max",
+		Help: "Largest ratio of a member's primary assignments of one balance group to an even share of that group. One is fair; N members' worth of skew reads as N.",
+	})
+	allocatorPrimarySwapTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "gazette_allocator_primary_swap_total",
+		Help: "Cumulative number of primary assignments exchanged to rebalance a balance group. Must flatten once settled; a sustained rate indicates oscillation.",
+	})
 )
