@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -290,6 +291,128 @@ func requireSinglePrimaryPerItem(t *testing.T, ctx context.Context, client *clie
 	for itemID, members := range primaries {
 		require.Len(t, members, 1, "item %s has multiple primaries: %v", itemID, members)
 	}
+}
+
+// TestPrimaryCooldownElapsed covers the pacing predicate directly, so the
+// interval is exercised without a clock or a sleep.
+func TestPrimaryCooldownElapsed(t *testing.T) {
+	var t0 = time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+
+	for _, tc := range []struct {
+		name     string
+		now      time.Time
+		lastSwap time.Time
+		interval time.Duration
+		expect   bool
+	}{
+		{"zero interval never paces", t0, t0, 0, true},
+		{"zero lastSwap always elapses", t0, time.Time{}, time.Minute, true},
+		{"before the interval", t0.Add(29 * time.Second), t0, 30 * time.Second, false},
+		{"exactly at the interval", t0.Add(30 * time.Second), t0, 30 * time.Second, true},
+		{"past the interval", t0.Add(31 * time.Second), t0, 30 * time.Second, true},
+		{"clock stepped backwards", t0, t0.Add(time.Minute), 30 * time.Second, false},
+	} {
+		require.Equal(t, tc.expect,
+			primaryCooldownElapsed(tc.now, tc.lastSwap, tc.interval), tc.name)
+	}
+}
+
+// TestPrimarySwapIntervalPacesHandoffs verifies that handoffs are withheld
+// until the interval elapses, even though rounds keep firing -- which is the
+// whole point, since an applied handoff is itself an Etcd write that wakes the
+// next round.
+func TestPrimarySwapIntervalPacesHandoffs(t *testing.T) {
+	var ctx, client, ks = testSetup(t)
+	require.NoError(t, insert(ctx, client, newTopicFixture(6, 2)...))
+
+	// Settle with balancing off, leaving primaries skewed 4/2/0.
+	serveUntilIdle(t, ctx, client, ks, "")
+	require.Equal(t, map[string]int{"member-A1": 4, "member-A2": 2},
+		primaryCounts(t, ctx, client, "topic-a/"))
+
+	// A stub clock which never advances: the first round may hand off, and
+	// every round after it is inside the cooldown.
+	var clock = time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	var swapsFor = func(interval time.Duration) int {
+		var before = totalPrimaryMoves(t, ctx, client, "topic-a/")
+		serveWithClock(t, ctx, client, ks, "", 1, interval,
+			func() time.Time { return clock }, nil)
+		return totalPrimaryMoves(t, ctx, client, "topic-a/") - before
+	}
+
+	// Budget of one, an interval that never elapses on a frozen clock: exactly
+	// one handoff is applied no matter how many rounds run.
+	require.Equal(t, 1, swapsFor(time.Hour))
+
+	// Advancing past the interval releases exactly one more.
+	clock = clock.Add(time.Hour)
+	require.Equal(t, 1, swapsFor(time.Hour))
+
+	// With no interval, the remaining correction completes in one serve.
+	require.Equal(t, 0, swapsFor(0))
+	require.Equal(t, map[string]int{"member-A1": 2, "member-A2": 2, "member-B": 2},
+		primaryCounts(t, ctx, client, "topic-a/"))
+}
+
+// TestPrimarySwapAppliedCountArmsCooldown verifies that converge reports only
+// the handoffs it actually applied. The count is what arms the pacing cooldown,
+// so a proposal which buildSwapPrimaryOps declines must not consume the
+// interval -- otherwise a permanently-blocked Item would idle the mechanism.
+func TestPrimarySwapAppliedCountArmsCooldown(t *testing.T) {
+	var ctx, client, ks = testSetup(t)
+
+	require.NoError(t, insert(ctx, client,
+		"/root/members/zone-a#mA", `{"R": 20}`,
+		"/root/members/zone-b#mB", `{"R": 20}`,
+		"/root/members/zone-c#mC", `{"R": 20}`,
+
+		"/root/items/g/i1", `{"R": 2, "G": "g"}`,
+		"/root/assign/g/i1#zone-a#mA#0", `consistent`,
+		"/root/assign/g/i1#zone-b#mB#1", `consistent`,
+	))
+
+	var state = NewObservedState(ks, MemberKey(ks, "zone-a", "mA"), isConsistent)
+	require.NoError(t, ks.Load(ctx, client, 0))
+
+	// A desired state matching the current one, so nothing but a handoff can
+	// be emitted.
+	var desired = []Assignment{
+		{ItemID: "g/i1", MemberZone: "zone-a", MemberSuffix: "mA"},
+		{ItemID: "g/i1", MemberZone: "zone-b", MemberSuffix: "mB"},
+	}
+
+	// mC does not replicate the Item, so the handoff cannot be applied.
+	var txn mockTxnBuilder
+	var applied, err = converge(&txn, state, desired, true,
+		map[string]memberID{"g/i1": {zone: "zone-c", suffix: "mC"}})
+
+	require.NoError(t, err)
+	require.Zero(t, applied, "a declined handoff must not arm the cooldown")
+	require.Empty(t, txn.ops)
+
+	// mB does replicate it, consistently, so this one is applied.
+	txn = mockTxnBuilder{}
+	applied, err = converge(&txn, state, desired, true,
+		map[string]memberID{"g/i1": {zone: "zone-b", suffix: "mB"}})
+
+	require.NoError(t, err)
+	require.Equal(t, 1, applied)
+
+	// The exchange is one transaction over four distinct keys: neither key is
+	// both put and deleted, which is what lets it be atomic.
+	require.Equal(t, []clientv3.Op{
+		clientv3.OpDelete("/root/assign/g/i1#zone-a#mA#0"),
+		clientv3.OpDelete("/root/assign/g/i1#zone-b#mB#1"),
+		clientv3.OpPut("/root/assign/g/i1#zone-a#mA#1", "consistent"),
+		clientv3.OpPut("/root/assign/g/i1#zone-b#mB#0", "consistent"),
+	}, txn.ops)
+}
+
+// totalPrimaryMoves counts primaries held by Members which the unbalanced
+// fixture never assigns them to, giving a monotonic measure of how many
+// handoffs have been applied so far.
+func totalPrimaryMoves(t *testing.T, ctx context.Context, client *clientv3.Client, itemPrefix string) int {
+	return primaryCounts(t, ctx, client, itemPrefix)["member-B"]
 }
 
 // newTopicFixture returns keys and values declaring |partitions| partitions of

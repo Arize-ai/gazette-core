@@ -102,9 +102,22 @@ unless grouping across prefixes is what you intend. Journals with no
 Balancing must also be enabled on the brokers, with
 ``--broker.balance-primaries`` (or ``BROKER_BALANCE_PRIMARIES``) set to the
 maximum number of primaries which may be handed off per allocation round. It
-defaults to zero, which disables the feature. Handing off a primary tears down
-and re-establishes the journal's replication pipeline, so a small value such as
-``2`` or ``4`` corrects accumulated imbalance gradually rather than all at once.
+defaults to zero, which disables the feature.
+
+Handing off a primary tears down and re-establishes the journal's replication
+pipeline, so it is usually desirable to correct accumulated imbalance gradually.
+Note that ``--broker.balance-primaries`` alone does *not* do that: allocation
+rounds are driven by Etcd writes rather than by a timer, and an applied handoff
+is itself a write which wakes the next round. A budget of ``4`` therefore yields
+roughly four handoffs per Etcd round-trip -- hundreds of them within seconds.
+
+Use ``--broker.balance-primary-interval`` (or
+``BROKER_BALANCE_PRIMARY_INTERVAL``, default ``10s``) to set the minimum time
+between rounds which hand off a primary. The budget then governs how large a
+burst may be, and the interval governs the sustained rate: at ``4`` per ``10s``,
+600 skewed primaries settle over about 25 minutes rather than about 6 seconds.
+The interval is only consumed by handoffs actually applied, so a journal which
+cannot be handed off yet does not stall the others.
 
 Primaries can only be spread across brokers which already replicate the group,
 so a group whose replicas are themselves concentrated on a few brokers is

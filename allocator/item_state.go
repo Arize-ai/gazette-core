@@ -20,6 +20,10 @@ type itemState struct {
 	// Assignment, as determined by rebalanceGroupPrimaries, or the zero value
 	// if its primary should stay where it is. Set per Item by converge.
 	desiredPrimary memberID
+	// swapsApplied counts primary handoffs actually applied across every Item
+	// of a converge pass -- which may be fewer than were proposed, since
+	// buildSwapPrimaryOps declines some. It accumulates across init.
+	swapsApplied int
 
 	item    int                // Index of current Item within |global.Items|.
 	current keyspace.KeyValues // Sub-slice of Item's current Assignments within |global.Assignments|.
@@ -35,6 +39,7 @@ func (s *itemState) init(item int, current keyspace.KeyValues, desired []Assignm
 	*s = itemState{
 		global:           s.global,
 		balancePrimaries: s.balancePrimaries,
+		swapsApplied:     s.swapsApplied,
 
 		item:    item,
 		current: current,
@@ -405,6 +410,7 @@ func (s *itemState) buildSwapPrimaryOps(txn checkpointTxn) bool {
 			s.creditGroupPrimary(ind, 1)
 		}
 		allocatorPrimarySwapTotal.Inc()
+		s.swapsApplied++
 		return true
 	}
 	return false // The desired Member is no longer a staying replica.

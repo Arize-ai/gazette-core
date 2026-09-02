@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -1038,6 +1039,12 @@ func serveUntilIdle(t *testing.T, ctx context.Context, client *clientv3.Client, 
 // every convergence round -- including rounds which are not idle, where an Item
 // may be simultaneously gaining or losing replicas.
 func serveUntilIdleWithPrimaryBalance(t *testing.T, ctx context.Context, client *clientv3.Client, ks *keyspace.KeySpace, when string, maxSwaps int, perRound func()) int {
+	return serveWithClock(t, ctx, client, ks, when, maxSwaps, 0, nil, perRound)
+}
+
+// serveWithClock is serveUntilIdleWithPrimaryBalance with an explicit handoff
+// interval and time source, so pacing may be exercised without sleeping.
+func serveWithClock(t *testing.T, ctx context.Context, client *clientv3.Client, ks *keyspace.KeySpace, when string, maxSwaps int, interval time.Duration, now func() time.Time, perRound func()) int {
 	// Pluck out the key of the current Member leader. We'll assume its identity.
 	var resp, err = client.Get(ctx, ks.Root+MembersPrefix,
 		clientv3.WithPrefix(),
@@ -1059,6 +1066,8 @@ func serveUntilIdleWithPrimaryBalance(t *testing.T, ctx context.Context, client 
 		Etcd:                    client,
 		State:                   state,
 		MaxPrimarySwapsPerRound: maxSwaps,
+		MinPrimarySwapInterval:  interval,
+		Now:                     now,
 		TestHook: func(round int, idle bool) {
 			if perRound != nil {
 				perRound()

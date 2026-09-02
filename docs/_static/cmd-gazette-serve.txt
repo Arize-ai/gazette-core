@@ -45,6 +45,9 @@ Broker:
       --broker.balance-primaries=                     Maximum primary journal assignments handed off per allocation round, to balance primaries
                                                       across brokers within a journal's app.gazette.dev/balance-group label. If zero, primary
                                                       balancing is disabled (default: 0) [$BROKER_BALANCE_PRIMARIES]
+      --broker.balance-primary-interval=              Minimum time between allocation rounds which hand off a primary journal assignment.
+                                                      Allocation rounds are driven by Etcd writes rather than a timer, so this paces the
+                                                      correction of accumulated imbalance (default: 10s) [$BROKER_BALANCE_PRIMARY_INTERVAL]
 
 Etcd:
       --etcd.address=                                 Etcd service address endpoint (default: http://localhost:2379) [$ETCD_ADDRESS]

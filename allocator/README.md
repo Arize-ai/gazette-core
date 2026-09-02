@@ -112,7 +112,21 @@ both no-ops unless `AllocateArgs.MaxPrimarySwapsPerRound` is non-zero:
   path proves the group is already optimal.
 
 A primary handoff tears down and re-establishes a journal's replication
-pipeline, so swaps are bounded per round and skew is corrected gradually.
+pipeline, so handoffs are paced by two independent knobs.
+`AllocateArgs.MaxPrimarySwapsPerRound` bounds how many may be applied in one
+round, and `MinPrimarySwapInterval` sets the minimum wall-clock time between
+rounds which apply any.
+
+Both are needed, because a convergence round is **event-driven, not periodic**:
+`Allocate` blocks in `keyspace.WaitForRevision` until Etcd advances, and an
+applied handoff is itself a write which wakes the next round. The per-round
+bound therefore limits burst size but not rate -- without an interval, handoffs
+proceed at roughly one bound per Etcd round-trip. The interval is armed only by
+handoffs actually applied, so an Item which cannot be handed off (because it is
+concurrently gaining or losing replicas) does not consume it.
+
 `itemState.buildSwapPrimaryOps` exchanges both Slots within a single
 `checkpointTxn` checkpoint, so an Item is never observed with two Slot 0
-Assignments.
+Assignments. This is possible in one transaction because an Assignment key
+carries both Member and Slot, leaving all four keys distinct -- no key is both
+put and deleted.

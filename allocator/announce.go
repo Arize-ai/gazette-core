@@ -98,6 +98,9 @@ type SessionArgs struct {
 	// MaxPrimarySwapsPerRound is passed through to AllocateArgs. Zero disables
 	// primary balancing.
 	MaxPrimarySwapsPerRound int
+	// MinPrimarySwapInterval is passed through to AllocateArgs. Zero applies
+	// no pacing to primary handoffs.
+	MinPrimarySwapInterval time.Duration
 }
 
 // StartSession starts an allocator session. It:
@@ -161,6 +164,7 @@ func StartSession(args SessionArgs) error {
 			Etcd:                    args.Etcd,
 			State:                   args.State,
 			MaxPrimarySwapsPerRound: args.MaxPrimarySwapsPerRound,
+			MinPrimarySwapInterval:  args.MinPrimarySwapInterval,
 			TestHook:                args.TestHook,
 		})
 		if errors.Cause(err) == context.Canceled {
