@@ -20,6 +20,25 @@ type AllocateArgs struct {
 	Etcd *clientv3.Client
 	// Allocator state, which is derived from a Watched KeySpace.
 	State *State
+	// MaxPrimarySwapsPerRound bounds the number of primary Assignments which
+	// may be handed off within a balance group in one convergence round (see
+	// ItemGroupValue). Zero -- the default -- disables primary balancing
+	// entirely, leaving allocation identical to a build without the feature.
+	//
+	// This bounds the size of a burst, not its rate: rounds are driven by Etcd
+	// revisions rather than a timer, and an applied handoff is itself a write
+	// which wakes the next round. Use MinPrimarySwapInterval to pace them.
+	MaxPrimarySwapsPerRound int
+	// MinPrimarySwapInterval is the minimum wall-clock time between rounds
+	// which apply primary handoffs. Zero -- the default -- applies no pacing,
+	// so handoffs proceed as fast as rounds occur, which is roughly one
+	// MaxPrimarySwapsPerRound per Etcd round-trip. Since each handoff tears
+	// down and re-establishes an Item's replication pipeline, an interval
+	// spreads the correction of accumulated skew over minutes or hours.
+	MinPrimarySwapInterval time.Duration
+	// Now returns the current time, and defaults to time.Now. It exists so
+	// tests may exercise MinPrimarySwapInterval without sleeping.
+	Now func() time.Time
 	// TestHook is an optional testing hook, invoked after each convergence round.
 	TestHook func(round int, isIdle bool)
 }
@@ -49,6 +68,12 @@ func Allocate(args AllocateArgs) error {
 	var ks = args.State.KS
 	var ctx = args.Context
 	var round int
+
+	var now = args.Now
+	if now == nil {
+		now = time.Now
+	}
+	var lastSwapAt time.Time // Zero until a handoff is applied.
 
 	defer ks.Mu.RUnlock()
 	ks.Mu.RLock()
@@ -105,10 +130,28 @@ func Allocate(args AllocateArgs) error {
 			var txn = newBatchedTxn(ctx, args.Etcd,
 				modRevisionUnchanged(state.Members[state.LocalMemberInd]))
 
+			// Determine primary handoffs which improve balance within a
+			// balance group. This does no work at all -- and allocates
+			// nothing -- when balancing is off, when a handoff was applied too
+			// recently, or when every group is already fair, which is the
+			// steady state of a healthy cluster.
+			var swaps map[string]memberID
+			if primaryCooldownElapsed(now(), lastSwapAt, args.MinPrimarySwapInterval) {
+				swaps = rebalanceGroupPrimaries(state, args.MaxPrimarySwapsPerRound)
+			}
+
 			// Converge the current state towards |desired|.
 			var err error
-			if err = converge(txn, state, desired); err == nil {
+			var swapsApplied int
+			if swapsApplied, err = converge(txn, state, desired,
+				args.MaxPrimarySwapsPerRound > 0, swaps); err == nil {
 				err = txn.Flush()
+			}
+			// Arm the cooldown only on handoffs actually applied. A proposal
+			// may be declined (see buildSwapPrimaryOps), and arming on a
+			// declined one would idle the mechanism for no benefit.
+			if err == nil && swapsApplied != 0 {
+				lastSwapAt = now()
 			}
 
 			// We must read through any Etcd transactions applied by `txn`,
@@ -123,9 +166,7 @@ func Allocate(args AllocateArgs) error {
 			} else {
 				allocatorConvergeTotal.Inc()
 
-				allocatorNumMembers.Set(float64(len(state.Members)))
-				allocatorNumItems.Set(float64(len(state.Items)))
-				allocatorNumItemSlots.Set(float64(state.ItemSlots))
+				setStateMetrics(state)
 
 				if args.TestHook != nil {
 					args.TestHook(round, txn.Revision() == 0)
@@ -146,8 +187,13 @@ func Allocate(args AllocateArgs) error {
 // not cause any Item or Member replication constraints to be violated (eg, by
 // leaving an Item with too few consistent replicas, or a Member with too many
 // assigned Items).
-func converge(txn checkpointTxn, as *State, desired []Assignment) error {
-	var itemState = itemState{global: as}
+//
+// It returns the number of primary handoffs it applied (see
+// buildSwapPrimaryOps), which may be fewer than were proposed.
+func converge(txn checkpointTxn, as *State, desired []Assignment,
+	balancePrimaries bool, swaps map[string]memberID) (int, error) {
+
+	var itemState = itemState{global: as, balancePrimaries: balancePrimaries}
 	var lastCRE int // cur.RightEnd of the previous iteration.
 
 	// Walk Items, joined with their current Assignments. Simultaneously walk
@@ -163,7 +209,7 @@ func converge(txn checkpointTxn, as *State, desired []Assignment) error {
 		// Remove any Assignments skipped between the last cursor iteration, and this
 		// one. They must not have an associated Item (eg, it was deleted).
 		if err := removeDeadAssignments(txn, as.KS, as.Assignments[lastCRE:cur.RightBegin]); err != nil {
-			return err
+			return itemState.swapsApplied, err
 		}
 		lastCRE = cur.RightEnd
 
@@ -174,17 +220,29 @@ func converge(txn checkpointTxn, as *State, desired []Assignment) error {
 
 		// Initialize |itemState|, computing the delta of current and |desired| Item Assignments.
 		itemState.init(cur.Left, as.Assignments[cur.RightBegin:cur.RightEnd], desired[:limit])
+		itemState.desiredPrimary = swaps[itemAt(as.Items, cur.Left).ID]
+
 		if err := itemState.constrainAndBuildOps(txn); err != nil {
-			return err
+			return itemState.swapsApplied, err
 		}
 		desired = desired[limit:]
 	}
 	// Remove any trailing, dead Assignments.
 	if err := removeDeadAssignments(txn, as.KS, as.Assignments[lastCRE:]); err != nil {
-		return err
+		return itemState.swapsApplied, err
 	}
 
-	return nil
+	return itemState.swapsApplied, nil
+}
+
+// primaryCooldownElapsed reports whether enough time has passed since the last
+// applied primary handoff to apply more. A zero |lastSwap| -- no handoff yet in
+// this process -- or a zero |interval| always elapses.
+func primaryCooldownElapsed(now, lastSwap time.Time, interval time.Duration) bool {
+	if interval == 0 || lastSwap.IsZero() {
+		return true
+	}
+	return !now.Before(lastSwap.Add(interval))
 }
 
 // removeDeadAssignments removes Assignments |asn|, after verifying each has no associated Item.
@@ -438,3 +496,27 @@ func (b *batchedTxn) debugLogTxn(response *clientv3.TxnResponse, err error) {
 // configuration at runtime with --max-txn-ops. We assume the default and will
 // error if a smaller value is used.
 var maxTxnOps = 128
+
+// setStateMetrics publishes gauges derived from the current State, once per
+// applied converge round. The *Vec gauges are reset first so that departed
+// Members do not linger as stale series.
+func setStateMetrics(s *State) {
+	allocatorNumMembers.Set(float64(len(s.Members)))
+	allocatorNumItems.Set(float64(len(s.Items)))
+	allocatorNumItemSlots.Set(float64(s.ItemSlots))
+	allocatorNumGroups.Set(float64(len(s.GroupNames) - 1))
+	allocatorGroupPrimarySpreadMax.Set(float64(s.MaxGroupPrimarySpread))
+	allocatorGroupPrimaryShareMax.Set(s.maxGroupPrimaryShare())
+
+	allocatorMemberAssignments.Reset()
+	allocatorMemberPrimaries.Reset()
+
+	for m := range s.Members {
+		var member = memberAt(s.Members, m)
+
+		allocatorMemberAssignments.WithLabelValues(member.Zone, member.Suffix).
+			Set(float64(s.MemberTotalCount[m]))
+		allocatorMemberPrimaries.WithLabelValues(member.Zone, member.Suffix).
+			Set(float64(s.MemberPrimaryCount[m]))
+	}
+}

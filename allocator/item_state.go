@@ -12,6 +12,19 @@ import (
 type itemState struct {
 	global *State
 
+	// balancePrimaries enables group-aware primary selection. It is false
+	// unless AllocateArgs.MaxPrimarySwapsPerRound is non-zero, in which case
+	// every primary decision below reduces to its prior behavior.
+	balancePrimaries bool
+	// desiredPrimary is the Member which should take over this Item's primary
+	// Assignment, as determined by rebalanceGroupPrimaries, or the zero value
+	// if its primary should stay where it is. Set per Item by converge.
+	desiredPrimary memberID
+	// swapsApplied counts primary handoffs actually applied across every Item
+	// of a converge pass -- which may be fewer than were proposed, since
+	// buildSwapPrimaryOps declines some. It accumulates across init.
+	swapsApplied int
+
 	item    int                // Index of current Item within |global.Items|.
 	current keyspace.KeyValues // Sub-slice of Item's current Assignments within |global.Assignments|.
 
@@ -24,7 +37,9 @@ type itemState struct {
 // given |current| and |desired|.
 func (s *itemState) init(item int, current keyspace.KeyValues, desired []Assignment) {
 	*s = itemState{
-		global: s.global,
+		global:           s.global,
+		balancePrimaries: s.balancePrimaries,
+		swapsApplied:     s.swapsApplied,
 
 		item:    item,
 		current: current,
@@ -131,6 +146,7 @@ func (s *itemState) constrainReorders() {
 	var primary = struct {
 		index        int
 		isConsistent bool
+		groupLoad    int32
 		loadRatio    float32
 		kv           keyspace.KeyValue
 	}{index: -1}
@@ -138,18 +154,97 @@ func (s *itemState) constrainReorders() {
 	for i := range s.reorder {
 		var c = s.global.IsConsistent(item, s.reorder[i], s.current)
 		var r = s.global.memberLoadRatio(s.reorder[i], s.global.MemberPrimaryCount)
+		var g = s.groupPrimaryLoad(assignmentAt(s.reorder, i))
 
 		if primary.index == -1 ||
 			c == true && primary.isConsistent == false ||
-			c == primary.isConsistent && r < primary.loadRatio {
+			c == primary.isConsistent && (g < primary.groupLoad ||
+				g == primary.groupLoad && r < primary.loadRatio) {
 
-			primary.index, primary.isConsistent, primary.loadRatio, primary.kv = i, c, r, s.reorder[i]
+			primary.index, primary.isConsistent, primary.kv = i, c, s.reorder[i]
+			primary.groupLoad, primary.loadRatio = g, r
 		}
 	}
 
 	// Shift elements [0, primary.index) to the right, by one.
 	copy(s.reorder[1:primary.index+1], s.reorder[:primary.index])
 	s.reorder[0] = primary.kv
+}
+
+// groupPrimaryLoad returns the number of primary Assignments of this Item's
+// balance group already held by |a|'s Member. It returns zero -- making it
+// inert as a comparison key -- when primary balancing is disabled or the Item
+// declares no group.
+func (s *itemState) groupPrimaryLoad(a Assignment) int32 {
+	var gi = s.global.ItemGroups[s.item]
+	if !s.balancePrimaries || gi == 0 {
+		return 0
+	}
+	var ind, found = s.global.Members.Search(MemberKey(s.global.KS, a.MemberZone, a.MemberSuffix))
+	if !found {
+		return 0
+	}
+	return s.global.GroupPrimaryCount[s.global.groupCell(gi, ind)]
+}
+
+// constrainAddPrimary permutes Slot values among |s.add| so that Slot 0 falls
+// to the Member holding the fewest primary Assignments of this Item's balance
+// group. It acts only when Slot 0 is itself being added -- so no existing
+// primary is displaced and no handoff occurs -- and is inert for an Item which
+// declares no group.
+//
+// Without it, Slots follow the order in which desired Assignments were solved,
+// which is lexicographic on (zone, suffix). Every partition of a newly created
+// topic therefore hands its primary to the same Member, which is the dominant
+// source of primary skew.
+func (s *itemState) constrainAddPrimary() {
+	var gi = s.global.ItemGroups[s.item]
+	if !s.balancePrimaries || gi == 0 || len(s.add) < 2 {
+		return
+	}
+	var zero = -1
+	for i := range s.add {
+		if s.add[i].Slot == 0 {
+			zero = i
+			break
+		}
+	}
+	if zero == -1 {
+		return // The Item keeps a current primary; nothing to choose.
+	}
+
+	var best = zero
+	for i := range s.add {
+		if i != zero && s.betterGroupPrimary(gi, s.add[i], s.add[best]) {
+			best = i
+		}
+	}
+	s.add[zero].Slot, s.add[best].Slot = s.add[best].Slot, s.add[zero].Slot
+}
+
+// betterGroupPrimary returns whether |a| is a more suitable primary than |b|
+// for an Item of group |gi|, preferring the Member holding fewer of the
+// group's primaries, then the Member with the lower overall primary load
+// ratio, and finally the lower Member key so the choice is deterministic.
+func (s *itemState) betterGroupPrimary(gi int32, a, b Assignment) bool {
+	var ai, aok = s.global.Members.Search(MemberKey(s.global.KS, a.MemberZone, a.MemberSuffix))
+	var bi, bok = s.global.Members.Search(MemberKey(s.global.KS, b.MemberZone, b.MemberSuffix))
+
+	if !aok {
+		return false
+	} else if !bok {
+		return true
+	}
+
+	var ac = s.global.GroupPrimaryCount[s.global.groupCell(gi, ai)]
+	var bc = s.global.GroupPrimaryCount[s.global.groupCell(gi, bi)]
+
+	if ac != bc {
+		return ac < bc
+	} else if ar, br := s.global.memberPrimaryRatio(ai), s.global.memberPrimaryRatio(bi); ar != br {
+		return ar < br
+	}
+	return ai < bi
 }
 
 // constrainAdds prunes Assignments from |s.add| which would otherwise violate constraints.
@@ -213,6 +308,7 @@ func (s *itemState) buildPromoteOps(txn checkpointTxn) {
 		// Update to reflect the member's primary count has increased.
 		if ind, found := s.global.Members.Search(MemberKey(s.global.KS, a.MemberZone, a.MemberSuffix)); found {
 			s.global.MemberPrimaryCount[ind] += 1
+			s.creditGroupPrimary(ind, 1)
 		}
 		// Like buildRemoveOps, we allow for the possibility of !found (and do not
 		// panic). Note that a member without a member key will have an infinite
@@ -239,13 +335,85 @@ func (s *itemState) buildAddOps(txn checkpointTxn) {
 			clientv3.WithLease(clientv3.LeaseID(s.global.Members[ind].Raw.Lease))))
 
 		// Update to reflect the member's total count (and potentially primary count) has increased.
+		// Crediting the group as we go is what lets successive Items of one
+		// group, converged in a single pass, each pick a different primary.
 		if a.Slot == 0 {
 			s.global.MemberPrimaryCount[ind] += 1
+			s.creditGroupPrimary(ind, 1)
 		}
 		s.global.MemberTotalCount[ind] += 1
 
 		allocatorAssignmentAddedTotal.Inc()
 	}
+}
+
+// creditGroupPrimary adjusts the primary count of this Item's balance group
+// for Member |ind| by |delta|. It is a no-op for an ungrouped Item.
+func (s *itemState) creditGroupPrimary(ind int, delta int32) {
+	if gi := s.global.ItemGroups[s.item]; gi != 0 {
+		s.global.GroupPrimaryCount[s.global.groupCell(gi, ind)] += delta
+	}
+}
+
+// buildSwapPrimaryOps exchanges the Slots of the Item's current primary and
+// the staying Assignment of s.desiredPrimary, and reports whether it did so.
+//
+// Both halves are issued within one transaction checkpoint, and therefore one
+// Etcd transaction. That is essential rather than merely tidy: the Slot is part
+// of the Assignment key, so a promotion is a key move and not a value update.
+// Issuing the promotion without its matching demotion would leave the Item with
+// two Slot 0 Assignments, which readers resolve to whichever key sorts last
+// (see ext.Init) while both Members independently believe they are primary.
+//
+// The four keys involved are distinct -- the key carries both Member and Slot,
+// so no key is both put and deleted -- which is what makes the exchange
+// expressible as a single transaction at all.
+func (s *itemState) buildSwapPrimaryOps(txn checkpointTxn) bool {
+	if s.desiredPrimary == (memberID{}) || len(s.reorder) == 0 {
+		return false
+	}
+	var cur = assignmentAt(s.reorder, 0)
+	if cur.Slot != 0 {
+		return false // No current primary: constrainReorders promotes instead.
+	} else if cur.MemberZone == s.desiredPrimary.zone && cur.MemberSuffix == s.desiredPrimary.suffix {
+		return false // Already where we want it.
+	}
+	var item = itemAt(s.global.Items, s.item)
+
+	for k := 1; k != len(s.reorder); k++ {
+		var next = assignmentAt(s.reorder, k)
+
+		if next.MemberZone != s.desiredPrimary.zone || next.MemberSuffix != s.desiredPrimary.suffix {
+			continue
+		} else if !s.global.IsConsistent(item, s.reorder[k], s.current) {
+			return false // Never promote a replica which isn't caught up.
+		}
+		var curKV, nextKV = s.reorder[0], s.reorder[k]
+		cur.Slot, next.Slot = next.Slot, cur.Slot
+
+		txn.If(modRevisionUnchanged(curKV), modRevisionUnchanged(nextKV)).
+			Then(
+				clientv3.OpDelete(string(curKV.Raw.Key)),
+				clientv3.OpDelete(string(nextKV.Raw.Key)),
+				clientv3.OpPut(AssignmentKey(s.global.KS, cur), string(curKV.Raw.Value),
+					clientv3.WithLease(clientv3.LeaseID(curKV.Raw.Lease))),
+				clientv3.OpPut(AssignmentKey(s.global.KS, next), string(nextKV.Raw.Value),
+					clientv3.WithLease(clientv3.LeaseID(nextKV.Raw.Lease))),
+			)
+
+		if ind, found := s.global.Members.Search(MemberKey(s.global.KS, cur.MemberZone, cur.MemberSuffix)); found {
+			s.global.MemberPrimaryCount[ind] -= 1
+			s.creditGroupPrimary(ind, -1)
+		}
+		if ind, found := s.global.Members.Search(MemberKey(s.global.KS, s.desiredPrimary.zone, s.desiredPrimary.suffix)); found {
+			s.global.MemberPrimaryCount[ind] += 1
+			s.creditGroupPrimary(ind, 1)
+		}
+		allocatorPrimarySwapTotal.Inc()
+		s.swapsApplied++
+		return true
+	}
+	return false // The desired Member is no longer a staying replica.
 }
 
 // buildPackOps adds operations to |txn| which shift the Slot of up to one
@@ -279,13 +447,19 @@ func (s *itemState) constrainAndBuildOps(txn checkpointTxn) error {
 	s.constrainRemovals()
 	s.constrainReorders()
 	s.constrainAdds()
+	s.constrainAddPrimary()
 
 	s.buildAddOps(txn)
 	s.buildRemoveOps(txn)
 	s.buildPromoteOps(txn)
 
+	// An Item which is otherwise moving this round is left alone: it has no
+	// spare Slot bookkeeping to give, and deferring is free hysteresis, since
+	// the handoff is re-proposed on a later round if still worthwhile.
 	if len(s.add) == 0 && len(s.remove) == 0 {
-		s.buildPackOps(txn)
+		if !s.buildSwapPrimaryOps(txn) {
+			s.buildPackOps(txn)
+		}
 	}
 	return txn.Checkpoint()
 }

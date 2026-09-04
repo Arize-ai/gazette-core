@@ -31,6 +31,7 @@ It provides the core scheduling intelligence that keeps Gazette services highly 
 
 ### Key Interfaces
 - `ItemValue`: User-defined Item with `DesiredReplication() int`
+- `ItemGroupValue`: *Optional* Item interface declaring a `BalanceGroup() string` -- see "Balance groups"
 - `MemberValue`: User-defined Member with `ItemLimit() int` 
 - `IsConsistentFn`: Determines if Item replicas are synchronized enough to allow reassignment
 - `Decoder`: Decodes Etcd values into user-defined representations
@@ -58,3 +59,74 @@ The algorithm prioritizes:
 - **Balance**: Even distribution across Members and zones  
 - **Availability**: Maintains replication during reassignments
 - **Performance**: Incremental updates scale linearly with Items
+
+## Balance groups
+
+Balancing each Member's *total* Item count is necessary but not sufficient. A
+maximum assignment can place every partition of one topic -- and every one of
+their primaries -- onto a single Member while each Member's total count remains
+perfectly even. Since the Slot 0 (primary) replica bears extra load, that
+Member becomes a bottleneck no amount of total-count balancing will relieve.
+
+An Item may therefore declare a **balance group** through the optional
+`ItemGroupValue` interface. Items of a common group are balanced against one
+another, in addition to the existing total-count balancing. `*pb.JournalSpec`
+implements it from the `app.gazette.dev/balance-group` label; consumer
+`ShardSpec`s deliberately do not implement it, so consumer allocation is
+unchanged.
+
+The group value is opaque and matched exactly, so specifications under
+unrelated prefixes which share a value form one group. Prefer qualified values
+(`tracing/spans` rather than `spans`) unless grouping across prefixes is
+intended. An absent or empty value means the Item is ungrouped and is scheduled
+exactly as it was before groups existed -- so a deployment which labels nothing
+is unaffected.
+
+`State` extracts per-group bookkeeping on every observation, whether or not any
+balancing is enabled: `GroupNames` (dense, index zero being the ungrouped
+sentinel), `ItemGroups`, and the row-major `GroupPrimaryCount` and
+`GroupMemberReach` matrices. `MaxGroupPrimarySpread` summarizes the worst
+group's imbalance and gates rebalancing. `GroupMemberReach` matters because a
+Member can only be primary for an Item it already replicates -- so spread is
+measured only over Members which replicate part of the group, since counting a
+Member with no stake would report an imbalance no reassignment could close.
+
+### Primary balancing
+
+Primary (Slot 0) selection is deliberately decoupled from replica placement:
+the flow network decides *which Members replicate* an Item, and primary
+balancing only decides *which of those replicas is primary*. Two mechanisms,
+both no-ops unless `AllocateArgs.MaxPrimarySwapsPerRound` is non-zero:
+
+- `itemState.constrainAddPrimary` orders Slot assignment among an Item's *new*
+  Assignments, so a newly created topic spreads its primaries instead of
+  handing them all to the lexicographically-first Member. Nothing is demoted,
+  so this costs no churn at all.
+- `rebalanceGroupPrimaries` (`group_primary.go`) corrects *existing* skew. It
+  searches the transfer graph -- Member, to Items it is primary for, to those
+  Items' other replicas -- for an augmenting path to an under-loaded Member. A
+  single best swap is not always enough: some topologies need a multi-hop
+  rotation of primaries across several Items, and a naive one-swap rule either
+  deadlocks or oscillates. Each accepted path strictly reduces the sum of
+  squared per-Member counts, so the search terminates, and the absence of any
+  path proves the group is already optimal.
+
+A primary handoff tears down and re-establishes a journal's replication
+pipeline, so handoffs are paced by two independent knobs.
+`AllocateArgs.MaxPrimarySwapsPerRound` bounds how many may be applied in one
+round, and `MinPrimarySwapInterval` sets the minimum wall-clock time between
+rounds which apply any.
+
+Both are needed, because a convergence round is **event-driven, not periodic**:
+`Allocate` blocks in `keyspace.WaitForRevision` until Etcd advances, and an
+applied handoff is itself a write which wakes the next round. The per-round
+bound therefore limits burst size but not rate -- without an interval, handoffs
+proceed at roughly one bound per Etcd round-trip. The interval is armed only by
+handoffs actually applied, so an Item which cannot be handed off (because it is
+concurrently gaining or losing replicas) does not consume it.
+
+`itemState.buildSwapPrimaryOps` exchanges both Slots within a single
+`checkpointTxn` checkpoint, so an Item is never observed with two Slot 0
+Assignments. This is possible in one transaction because an Assignment key
+carries both Member and Slot, leaving all four keys distinct -- no key is both
+put and deleted.

@@ -48,6 +48,8 @@ var Config = new(struct {
 		WatchDelay                     time.Duration `long:"watch-delay" env:"WATCH_DELAY" default:"30ms" description:"Delay applied to the application of watched Etcd events. Larger values amortize the processing of fast-changing Etcd keys."`
 		AuthKeys                       string        `long:"auth-keys" env:"AUTH_KEYS" description:"Whitespace or comma separated, base64-encoded keys used to sign (first key) and verify (all keys) Authorization tokens." json:"-"`
 		AutoSuspend                    bool          `long:"auto-suspend" env:"AUTO_SUSPEND" description:"Automatically suspend journals which have persisted all fragments"`
+		BalancePrimaries               uint32        `long:"balance-primaries" env:"BALANCE_PRIMARIES" default:"0" description:"Maximum primary journal assignments handed off per allocation round, to balance primaries across brokers within a journal's app.gazette.dev/balance-group label. If zero, primary balancing is disabled"`
+		BalancePrimaryInterval         time.Duration `long:"balance-primary-interval" env:"BALANCE_PRIMARY_INTERVAL" default:"10s" description:"Minimum time between allocation rounds which hand off a primary journal assignment. Allocation rounds are driven by Etcd writes rather than a timer, so this paces the correction of accumulated imbalance"`
 		DisableSignedUrls              bool          `long:"disable-signed-urls" env:"DISABLE_SIGNED_URLS" description:"When a signed URL is requested, return an unsigned URL instead. This is useful when clients do not require the signing."`
 		ForceStoreHealthCheckToHealthy bool          `long:"force-store-health-check-to-healthy" env:"FORCE_STORE_HEALTH_CHECK_TO_HEALTHY" description:"Force the health check of fragment stores to healthy"`
 	} `group:"Broker" namespace:"broker" env-namespace:"BROKER"`
@@ -187,12 +189,14 @@ func (cmdServe) Execute(args []string) error {
 	}).Info("starting broker")
 
 	mbp.Must(allocator.StartSession(allocator.SessionArgs{
-		Etcd:     etcd,
-		Tasks:    tasks,
-		Spec:     spec,
-		State:    allocState,
-		LeaseTTL: Config.Etcd.LeaseTTL,
-		SignalCh: signalCh,
+		Etcd:                    etcd,
+		Tasks:                   tasks,
+		Spec:                    spec,
+		State:                   allocState,
+		LeaseTTL:                Config.Etcd.LeaseTTL,
+		SignalCh:                signalCh,
+		MaxPrimarySwapsPerRound: int(Config.Broker.BalancePrimaries),
+		MinPrimarySwapInterval:  Config.Broker.BalancePrimaryInterval,
 	}), "failed to start allocator session")
 
 	var persister = fragment.NewPersister(ks)
