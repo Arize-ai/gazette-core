@@ -37,6 +37,10 @@ Broker:
                                                       (default: 9) [$BROKER_MAX_REPLICATION]
       --broker.min-append-rate=                       Min rate (in bytes-per-sec) at which a client may stream Append RPC content. RPCs unable to
                                                       sustain this rate are aborted (default: 65536) [$BROKER_MIN_APPEND_RATE]
+      --broker.initial-window-size=                   HTTP/2 stream flow control window, in bytes. Zero (with initial-conn-window-size also zero)
+                                                      uses gRPC's dynamic BDP window sizing (default: 0) [$BROKER_INITIAL_WINDOW_SIZE]
+      --broker.initial-conn-window-size=              HTTP/2 connection flow control window, in bytes. Zero (with initial-window-size also zero)
+                                                      uses gRPC's dynamic BDP window sizing (default: 0) [$BROKER_INITIAL_CONN_WINDOW_SIZE]
       --broker.watch-delay=                           Delay applied to the application of watched Etcd events. Larger values amortize the
                                                       processing of fast-changing Etcd keys. (default: 30ms) [$BROKER_WATCH_DELAY]
       --broker.auth-keys=                             Whitespace or comma separated, base64-encoded keys used to sign (first key) and verify (all

@@ -34,26 +34,21 @@ func (c *AddressConfig) MustDial(ctx context.Context) *grpc.ClientConn {
 	var backoffConfig = backoff.DefaultConfig
 	backoffConfig.MaxDelay = 5 * time.Second
 
+	// A single Gazette broker frequently serves LOTS of Journals, so flow
+	// control sizing matters here: see server.InitialConnWindowSize. Take
+	// whatever the brokers are configured with, so a client's windows match the
+	// cluster's rather than silently diverging.
 	cc, err := grpc.DialContext(ctx,
 		c.Address.GRPCAddr(),
-		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(1024*1024*16)),
-		grpc.WithTransportCredentials(pb.NewDispatchedCredentials(tlsConfig, c.Address)),
-		grpc.WithConnectParams(grpc.ConnectParams{Backoff: backoffConfig}),
-		// A single Gazette broker frequently serves LOTS of Journals.
-		// Readers will start many concurrent reads of various journals,
-		// but may process them in arbitrary orders, which means a journal
-		// stream could be "readable" and have available stream-level flow control,
-		// but still not send data because the connection-level flow control window
-		// is filled. So, effectively disable connection-level flow control and use
-		// only stream-level flow control. Note that configuring either window
-		// disables gRPC's dynamic window sizing for both, so the stream window
-		// must be set explicitly rather than left to gRPC's 64KB fallback.
-		grpc.WithInitialConnWindowSize(server.InitialConnWindowSize),
-		grpc.WithInitialWindowSize(server.InitialWindowSize),
-		grpc.WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingConfig": [{"%s":{}}]}`, pb.DispatcherGRPCBalancerName)),
-		// Instrument client for gRPC metric collection.
-		grpc.WithUnaryInterceptor(grpc_prometheus.UnaryClientInterceptor),
-		grpc.WithStreamInterceptor(grpc_prometheus.StreamClientInterceptor),
+		append([]grpc.DialOption{
+			grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(1024 * 1024 * 16)),
+			grpc.WithTransportCredentials(pb.NewDispatchedCredentials(tlsConfig, c.Address)),
+			grpc.WithConnectParams(grpc.ConnectParams{Backoff: backoffConfig}),
+			grpc.WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingConfig": [{"%s":{}}]}`, pb.DispatcherGRPCBalancerName)),
+			// Instrument client for gRPC metric collection.
+			grpc.WithUnaryInterceptor(grpc_prometheus.UnaryClientInterceptor),
+			grpc.WithStreamInterceptor(grpc_prometheus.StreamClientInterceptor),
+		}, server.FlowControlDialOptions()...)...,
 	)
 	Must(err, "failed to dial remote service", "endpoint", c.Address)
 
