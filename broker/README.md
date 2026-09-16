@@ -31,6 +31,15 @@ This package is what transforms Gazette from a protocol definition into a runnin
 - **`resolver`**: Maps journal names to responsible broker routes and manages local replica lifecycle  
 - **`pipeline`**: Coordinates distributed write replication across broker peers for consistency
 - **`appendFSM`**: State machine managing the lifecycle of append operations with flow control and validation
+- **`appendFlowControl`** (`append_flow_control.go`): Polices each Append stream against `MinAppendRate`
+  (and the journal's `MaxAppendRate`). Note the minimum is measured against *wall-clock* time on the
+  stream, which includes time the broker spends between chunks replicating to peers and writing its
+  spool -- so an underflow is not by itself evidence of a slow client. `appendFlowStats` splits that
+  time into `wait` vs `process` and is logged with the failure.
+- **`proxyAppendStats`** (`append_api.go`): The counterpart on the relaying side. A primary blames its
+  "client", which is often another broker proxying, so a failed proxied Append logs where the relay's
+  time went -- waiting on its own client vs pushing to the primary. A broker logs `flow` or `proxy`,
+  never both: it is either the policer or the relay.
 
 ### Key APIs
 

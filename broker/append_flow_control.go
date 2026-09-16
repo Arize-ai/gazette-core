@@ -3,6 +3,7 @@ package broker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	pb "go.gazette.dev/core/broker/protocol"
@@ -50,6 +51,17 @@ type appendFlowControl struct {
 	totalChunks      int64 // Total number of chunks in the session.
 	delayedChunks    int64 // Number of delayed chunks in the session.
 
+	// MinAppendRate is policed against wall-clock time on the stream, which
+	// also covers time the broker itself spends between chunks -- scattering
+	// the prior chunk to peers and applying it to its spool. These fields
+	// separate the two, so that an underflow can be attributed to the side
+	// which actually stalled rather than always to the client.
+	startMillis     int64 // Time at which this session began.
+	waitMillis      int64 // Cumulative time spent waiting on the client.
+	waitFromMillis  int64 // Start of the wait interval not yet folded into |waitMillis|.
+	lastChunkMillis int64 // Time at which the most recent chunk arrived.
+	contentBytes    int64 // Total content bytes received in the session.
+
 	ticker       *time.Ticker     // Ticker of flowControlQuantums.
 	invalidateCh <-chan struct{}  // Signaled with the resolution is invalidated.
 	chunkCh      chan appendChunk // Internally transits chunks read from the RPC stream.
@@ -90,6 +102,9 @@ func (fc *appendFlowControl) reset(res *resolution, nowMillis int64) {
 		balance:    fc.balance,    // Keep prior balance.
 		lastMillis: fc.lastMillis, // Keep prior lastMillis.
 
+		startMillis:     nowMillis,
+		lastChunkMillis: nowMillis, // No chunk yet; measure idle time from the start.
+
 		invalidateCh: res.invalidateCh,
 		chunkCh:      make(chan appendChunk, 8),
 	}
@@ -115,21 +130,28 @@ func (fc *appendFlowControl) recv() (*pb.AppendRequest, error) {
 	var ch = fc.chunkCh // Nil-able local copy.
 	var req *pb.AppendRequest
 
+	fc.waitFromMillis = timeNow().UnixNano() / 1e6
+
 	for {
 		select {
 		case chunk := <-ch:
+			var now = fc.accountWait()
+
 			if chunk.err != nil {
 				fc.ticker.Stop()
 				return nil, chunk.err
 			}
 
 			req, ch = chunk.req, nil // Don't select again if we loop.
+			fc.lastChunkMillis = now
+			fc.contentBytes += int64(len(req.Content))
 			fc.onChunk(int64(len(req.Content)))
 
 		case now := <-fc.ticker.C:
 			var millis = now.UnixNano() / 1e6
 
 			if err := fc.onTick(millis); err != nil {
+				fc.accountWait()
 				fc.ticker.Stop()
 				return nil, err
 			}
@@ -141,6 +163,70 @@ func (fc *appendFlowControl) recv() (*pb.AppendRequest, error) {
 		if req != nil && fc.charge == 0 {
 			return req, nil
 		}
+	}
+}
+
+// accountWait folds the pending wait interval into |waitMillis| and returns the
+// current time. Once a chunk has arrived, further elapsed time within the same
+// recv() is throttle delay against MaxAppendRate (counted by |delayedChunks|)
+// rather than time spent waiting on the client, so the interval is accounted at
+// most once per recv().
+func (fc *appendFlowControl) accountWait() int64 {
+	var now = timeNow().UnixNano() / 1e6
+
+	if fc.waitFromMillis != 0 {
+		fc.waitMillis += now - fc.waitFromMillis
+		fc.waitFromMillis = 0
+	}
+	return now
+}
+
+// appendFlowStats summarizes a flow control session for diagnostic logging.
+// An underflow means the stream failed to sustain MinAppendRate against
+// wall-clock time, but says nothing about which side was responsible:
+// WaitMillis is time this broker spent waiting on its client, and
+// ProcessMillis is time it spent between chunks scattering to peers and
+// applying to its spool -- for which the client is charged all the same.
+type appendFlowStats struct {
+	ContentBytes  int64 `json:"content_bytes"`
+	TotalChunks   int64 `json:"total_chunks"`
+	DelayedChunks int64 `json:"delayed_chunks"`
+	StreamMillis  int64 `json:"stream_millis"`
+	WaitMillis    int64 `json:"wait_millis"`
+	ProcessMillis int64 `json:"process_millis"`
+	IdleMillis    int64 `json:"idle_millis"`
+}
+
+// String renders stats compactly. The JSON log formatter used in production
+// marshals the struct's fields instead; this keeps text-formatted output (tests
+// and local runs) from degrading into an unlabeled tuple.
+func (s appendFlowStats) String() string {
+	return fmt.Sprintf("bytes=%d chunks=%d/%d stream=%dms wait=%dms process=%dms idle=%dms",
+		s.ContentBytes, s.DelayedChunks, s.TotalChunks,
+		s.StreamMillis, s.WaitMillis, s.ProcessMillis, s.IdleMillis)
+}
+
+// stalled names the side which held up the stream, for metric labeling.
+func (s appendFlowStats) stalled() string {
+	if s.WaitMillis >= s.ProcessMillis {
+		return "client"
+	}
+	return "broker"
+}
+
+// stats of the flow control session, as of now.
+func (fc *appendFlowControl) stats() appendFlowStats {
+	var now = timeNow().UnixNano() / 1e6
+	var stream = now - fc.startMillis
+
+	return appendFlowStats{
+		ContentBytes:  fc.contentBytes,
+		TotalChunks:   fc.totalChunks,
+		DelayedChunks: fc.delayedChunks,
+		StreamMillis:  stream,
+		WaitMillis:    fc.waitMillis,
+		ProcessMillis: stream - fc.waitMillis,
+		IdleMillis:    now - fc.lastChunkMillis,
 	}
 }
 

@@ -265,3 +265,77 @@ func installAppendTimeoutFixture() (uninstall func()) {
 		flowControlQuantum = b
 	}
 }
+
+// TestAppendFlowStatsAttributeBrokerTime covers the case which motivated these
+// stats: the client is never the reason the stream is slow, but MinAppendRate is
+// policed against wall-clock time and would charge it for the broker's own
+// per-chunk work all the same.
+func TestAppendFlowStatsAttributeBrokerTime(t *testing.T) {
+	defer func(v int64) { MinAppendRate = v }(MinAppendRate)
+	MinAppendRate = 1e2 // 0.1 byte per milli.
+
+	defer func(f func() time.Time) { timeNow = f }(timeNow)
+	var millis int64 = 10000
+	timeNow = func() time.Time { return time.Unix(0, millis*1e6) }
+
+	var fc appendFlowControl
+	fc.reset(&resolution{journalSpec: &pb.JournalSpec{}}, millis)
+	fc.ticker = time.NewTicker(time.Hour) // Never fires.
+	defer fc.ticker.Stop()
+
+	// Each chunk is already available when recv() is called, so the client never
+	// makes us wait. Time passes between calls instead, as it does while the
+	// caller scatters the prior chunk to peers and applies it to its spool.
+	for i := 0; i != 3; i++ {
+		fc.chunkCh <- appendChunk{
+			req: &pb.AppendRequest{Content: bytes.Repeat([]byte("x"), 1000)},
+		}
+		var _, err = fc.recv()
+		require.NoError(t, err)
+
+		millis += 500
+	}
+
+	require.Equal(t, appendFlowStats{
+		ContentBytes:  3000,
+		TotalChunks:   3,
+		DelayedChunks: 0,
+		StreamMillis:  1500,
+		WaitMillis:    0,
+		ProcessMillis: 1500,
+		IdleMillis:    500,
+	}, fc.stats())
+}
+
+// TestAppendFlowStatsAttributeClientTime is the converse: time elapses while
+// parked waiting on the client, and is accounted exactly once.
+func TestAppendFlowStatsAttributeClientTime(t *testing.T) {
+	defer func(f func() time.Time) { timeNow = f }(timeNow)
+	var millis int64 = 10000
+	timeNow = func() time.Time { return time.Unix(0, millis*1e6) }
+
+	var fc appendFlowControl
+	fc.reset(&resolution{journalSpec: &pb.JournalSpec{}}, millis)
+
+	// A chunk arrives immediately.
+	fc.waitFromMillis = millis
+	fc.lastChunkMillis = fc.accountWait()
+	fc.contentBytes, fc.totalChunks = 1000, 1
+
+	// The client then goes quiet, and recv() parks in its select throughout.
+	fc.waitFromMillis = millis
+	millis += 1200
+	fc.accountWait()
+	fc.accountWait() // Already accounted; adds nothing.
+
+	require.Equal(t, appendFlowStats{
+		ContentBytes:  1000,
+		TotalChunks:   1,
+		DelayedChunks: 0,
+		StreamMillis:  1200,
+		WaitMillis:    1200,
+		ProcessMillis: 0,
+		IdleMillis:    1200,
+	}, fc.stats())
+	require.Equal(t, "client", fc.stats().stalled())
+}
