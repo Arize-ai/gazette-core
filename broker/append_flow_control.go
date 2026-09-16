@@ -21,6 +21,14 @@ var (
 	// limit the impact of slow or faulted clients over the pipeline, which is
 	// an exclusively owned and highly contended resource.
 	MinAppendRate int64 = 1 << 16 // 64K per second.
+	// MinAppendRateGrace is the window over which an Append RPC client may
+	// deliver no data before it's aborted for failing MinAppendRate. It bounds
+	// the credit a client accrues, so it caps the tolerated gap for the whole
+	// session and not merely its start. Note that at the default rate the
+	// budget is only two 32KB chunks deep, so a bursty writer which holds an
+	// append open between bursts needs this raised -- lowering MinAppendRate
+	// does not help, as both the budget and its decay scale with it.
+	MinAppendRateGrace = time.Second
 	// ErrFlowControlUnderflow is returned if an Append RPC was terminated due to
 	// flow control policing. Specifically, the client failed to sustain the
 	// MinAppendRate when sending content chunks of the stream.
@@ -61,6 +69,15 @@ type appendFlowControl struct {
 	waitFromMillis  int64 // Start of the wait interval not yet folded into |waitMillis|.
 	lastChunkMillis int64 // Time at which the most recent chunk arrived.
 	contentBytes    int64 // Total content bytes received in the session.
+
+	// The largest gap between chunks is what actually decides an underflow,
+	// whereas the gap at the moment of failure may be much smaller: |spent|
+	// caps at MinAppendRateGrace worth of bytes, so a single chunk arriving
+	// after a near-drain only partially refills it and buys proportionally
+	// less time. |minSpent| records how close the session came to zero.
+	maxGapMillis int64 // Largest interval between chunk arrivals.
+	minSpent     int64 // Low-water mark of |spent|.
+	spentCap     int64 // Maximum |spent| may be replenished to.
 
 	ticker       *time.Ticker     // Ticker of flowControlQuantums.
 	invalidateCh <-chan struct{}  // Signaled with the resolution is invalidated.
@@ -120,9 +137,12 @@ func (fc *appendFlowControl) reset(res *resolution, nowMillis int64) {
 	} else {
 		_ = fc.onTick(nowMillis)
 	}
-	// Allow an initial delay of |MinAppendRate| bytes.
+	// Allow an initial delay of |MinAppendRateGrace| worth of bytes. The same
+	// budget caps replenishment in debit(), so that it bounds the tolerated gap
+	// throughout the session rather than only at its start.
 	fc.minRate = MinAppendRate
-	fc.spent = MinAppendRate * int64(flowControlBurstFactor) / int64(time.Second)
+	fc.spentCap = MinAppendRate * int64(MinAppendRateGrace) / int64(time.Second)
+	fc.spent, fc.minSpent = fc.spentCap, fc.spentCap
 }
 
 // recv returns the next flow-controlled AppendRequest chunk.
@@ -143,6 +163,9 @@ func (fc *appendFlowControl) recv() (*pb.AppendRequest, error) {
 			}
 
 			req, ch = chunk.req, nil // Don't select again if we loop.
+			// Measure the first chunk's gap from the session start: a slow
+			// first chunk starves the pipeline exactly as a slow later one does.
+			fc.maxGapMillis = max64(fc.maxGapMillis, now-fc.lastChunkMillis)
 			fc.lastChunkMillis = now
 			fc.contentBytes += int64(len(req.Content))
 			fc.onChunk(int64(len(req.Content)))
@@ -194,16 +217,23 @@ type appendFlowStats struct {
 	StreamMillis  int64 `json:"stream_millis"`
 	WaitMillis    int64 `json:"wait_millis"`
 	ProcessMillis int64 `json:"process_millis"`
+	// IdleMillis is the gap at the moment of failure, which is often not the
+	// gap responsible for it: MaxGapMillis is. MinSpentBytes says how close the
+	// session came to underflowing, and is zero exactly when it did.
 	IdleMillis    int64 `json:"idle_millis"`
+	MaxGapMillis  int64 `json:"max_gap_millis"`
+	MinSpentBytes int64 `json:"min_spent_bytes"`
 }
 
 // String renders stats compactly. The JSON log formatter used in production
 // marshals the struct's fields instead; this keeps text-formatted output (tests
 // and local runs) from degrading into an unlabeled tuple.
 func (s appendFlowStats) String() string {
-	return fmt.Sprintf("bytes=%d chunks=%d/%d stream=%dms wait=%dms process=%dms idle=%dms",
+	return fmt.Sprintf(
+		"bytes=%d chunks=%d/%d stream=%dms wait=%dms process=%dms idle=%dms maxGap=%dms minSpent=%d",
 		s.ContentBytes, s.DelayedChunks, s.TotalChunks,
-		s.StreamMillis, s.WaitMillis, s.ProcessMillis, s.IdleMillis)
+		s.StreamMillis, s.WaitMillis, s.ProcessMillis, s.IdleMillis,
+		s.MaxGapMillis, s.MinSpentBytes)
 }
 
 // stalled names the side which held up the stream, for metric labeling.
@@ -219,6 +249,8 @@ func (fc *appendFlowControl) stats() appendFlowStats {
 	var now = timeNow().UnixNano() / 1e6
 	var stream = now - fc.startMillis
 
+	var idle = now - fc.lastChunkMillis
+
 	return appendFlowStats{
 		ContentBytes:  fc.contentBytes,
 		TotalChunks:   fc.totalChunks,
@@ -226,7 +258,9 @@ func (fc *appendFlowControl) stats() appendFlowStats {
 		StreamMillis:  stream,
 		WaitMillis:    fc.waitMillis,
 		ProcessMillis: stream - fc.waitMillis,
-		IdleMillis:    now - fc.lastChunkMillis,
+		IdleMillis:    idle,
+		MaxGapMillis:  max64(fc.maxGapMillis, idle),
+		MinSpentBytes: fc.minSpent,
 	}
 }
 
@@ -246,6 +280,7 @@ func (fc *appendFlowControl) onTick(millis int64) error {
 	// Deduct |d| interval bytes from |spent|.
 	d = fc.minRate * (millis - fc.lastMillis) / 1e3
 	fc.spent -= min64(d, fc.spent)
+	fc.minSpent = min64(fc.minSpent, fc.spent)
 
 	fc.lastMillis = millis
 	fc.debit()
@@ -287,13 +322,14 @@ func (fc *appendFlowControl) debit() {
 	var d = min64(fc.balance, fc.charge)
 	fc.balance -= d
 	fc.charge -= d
-	fc.spent = min64(fc.spent+d, fc.minRate) // Add |d| bytes to |spent|, capping at |minRate|.
+	fc.spent = min64(fc.spent+d, fc.spentCap) // Add |d| bytes to |spent|, capping at the grace budget.
 
 	if fc.maxRate == 0 {
 		// |balance| is effectively infinite.
-		fc.spent = min64(fc.spent+fc.charge, fc.minRate)
+		fc.spent = min64(fc.spent+fc.charge, fc.spentCap)
 		fc.charge = 0
 	}
+	fc.minSpent = min64(fc.minSpent, fc.spent)
 }
 
 type appendChunk struct {
@@ -303,6 +339,13 @@ type appendChunk struct {
 
 func min64(a, b int64) int64 {
 	if a < b {
+		return a
+	}
+	return b
+}
+
+func max64(a, b int64) int64 {
+	if a > b {
 		return a
 	}
 	return b
