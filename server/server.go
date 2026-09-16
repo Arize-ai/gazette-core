@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -20,6 +21,28 @@ import (
 	"go.gazette.dev/core/task"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
+)
+
+var (
+	// InitialConnWindowSize is the HTTP/2 connection-level flow control window
+	// advertised by the Server and by its connections to peers. A single broker
+	// multiplexes appends, replications and reads of MANY journals over one
+	// connection per peer. gRPC sizes the connection window to the same value as
+	// an individual stream's window, so connection-level credit is oversubscribed
+	// by the number of concurrent streams: a stream may hold stream-level credit
+	// and still be unable to send because peers have filled the connection
+	// window. This starves proxied Appends in particular, which are policed
+	// against MinAppendRate by the primary the moment it acquires the pipeline.
+	// So, effectively disable connection-level flow control and rely on
+	// stream-level flow control alone.
+	InitialConnWindowSize int32 = math.MaxInt32
+	// InitialWindowSize is the HTTP/2 stream-level flow control window.
+	// Configuring any window size disables gRPC's dynamic (BDP-estimated) window
+	// sizing for streams as well as connections, so this must be chosen
+	// explicitly rather than left to gRPC's 64KB static fallback. It bounds
+	// worst-case buffering at (concurrent streams * InitialWindowSize) per
+	// connection: lower it in memory-constrained deployments.
+	InitialWindowSize int32 = 1 << 18 // 256KB.
 )
 
 // Server bundles gRPC & HTTP servers, multiplexed over a single bound TCP
@@ -106,6 +129,11 @@ func New(
 			grpc.StreamInterceptor(grpc_prometheus.StreamServerInterceptor),
 			grpc.UnaryInterceptor(grpc_prometheus.UnaryServerInterceptor),
 			grpc.MaxRecvMsgSize(int(maxGRPCRecvSize)),
+			// The window a receiver advertises bounds what its senders may push,
+			// so these govern all inbound traffic -- notably Appends relayed to
+			// us by a peer acting as proxy. See InitialConnWindowSize.
+			grpc.InitialConnWindowSize(InitialConnWindowSize),
+			grpc.InitialWindowSize(InitialWindowSize),
 		),
 	}
 
@@ -160,6 +188,11 @@ func New(
 		grpc.WithTransportCredentials(pb.NewDispatchedCredentials(peerTLS, srv.endpoint)),
 		grpc.WithConnectParams(grpc.ConnectParams{Backoff: backoffConfig}),
 		grpc.WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingConfig": [{"%s":{}}]}`, pb.DispatcherGRPCBalancerName)),
+		// This ClientConn is the origin of every broker-to-peer connection (its
+		// balancer dials peers directly), so these bound what we may push to a
+		// peer as well as what a peer may push to us. See InitialConnWindowSize.
+		grpc.WithInitialConnWindowSize(InitialConnWindowSize),
+		grpc.WithInitialWindowSize(InitialWindowSize),
 		// Instrument client for gRPC metric collection.
 		grpc.WithUnaryInterceptor(grpc_prometheus.UnaryClientInterceptor),
 		grpc.WithStreamInterceptor(grpc_prometheus.StreamClientInterceptor),

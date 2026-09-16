@@ -3,7 +3,6 @@ package mainboilerplate
 import (
 	"context"
 	"fmt"
-	"math"
 	"time"
 
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
@@ -46,8 +45,11 @@ func (c *AddressConfig) MustDial(ctx context.Context) *grpc.ClientConn {
 		// stream could be "readable" and have available stream-level flow control,
 		// but still not send data because the connection-level flow control window
 		// is filled. So, effectively disable connection-level flow control and use
-		// only stream-level flow control.
-		grpc.WithInitialConnWindowSize(math.MaxInt32),
+		// only stream-level flow control. Note that configuring either window
+		// disables gRPC's dynamic window sizing for both, so the stream window
+		// must be set explicitly rather than left to gRPC's 64KB fallback.
+		grpc.WithInitialConnWindowSize(server.InitialConnWindowSize),
+		grpc.WithInitialWindowSize(server.InitialWindowSize),
 		grpc.WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingConfig": [{"%s":{}}]}`, pb.DispatcherGRPCBalancerName)),
 		// Instrument client for gRPC metric collection.
 		grpc.WithUnaryInterceptor(grpc_prometheus.UnaryClientInterceptor),
