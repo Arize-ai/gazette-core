@@ -45,6 +45,7 @@ var Config = new(struct {
 		MaxAppendRate                  uint32        `long:"max-append-rate" env:"MAX_APPEND_RATE" default:"0" description:"Max rate (in bytes-per-sec) that any one journal may be appended to. If zero, there is no max rate"`
 		MaxReplication                 uint32        `long:"max-replication" env:"MAX_REPLICATION" default:"9" description:"Maximum effective replication of any one journal, which upper-bounds its stated replication."`
 		MinAppendRate                  uint32        `long:"min-append-rate" env:"MIN_APPEND_RATE" default:"65536" description:"Min rate (in bytes-per-sec) at which a client may stream Append RPC content. RPCs unable to sustain this rate are aborted"`
+		MinAppendRateGrace             time.Duration `long:"min-append-rate-grace" env:"MIN_APPEND_RATE_GRACE" default:"1s" description:"Window over which an Append RPC client may deliver no data before it's aborted for failing min-append-rate. Raise it to tolerate bursty writers which hold an append open between bursts"`
 		InitialWindowSize              int32         `long:"initial-window-size" env:"INITIAL_WINDOW_SIZE" default:"0" description:"HTTP/2 stream flow control window, in bytes. Zero (with initial-conn-window-size also zero) uses gRPC's dynamic BDP window sizing"`
 		InitialConnWindowSize          int32         `long:"initial-conn-window-size" env:"INITIAL_CONN_WINDOW_SIZE" default:"0" description:"HTTP/2 connection flow control window, in bytes. Zero (with initial-window-size also zero) uses gRPC's dynamic BDP window sizing"`
 		WatchDelay                     time.Duration `long:"watch-delay" env:"WATCH_DELAY" default:"30ms" description:"Delay applied to the application of watched Etcd events. Larger values amortize the processing of fast-changing Etcd keys."`
@@ -157,6 +158,7 @@ func (cmdServe) Execute(args []string) error {
 	broker.AutoSuspend = Config.Broker.AutoSuspend
 	broker.MaxAppendRate = int64(Config.Broker.MaxAppendRate)
 	broker.MinAppendRate = int64(Config.Broker.MinAppendRate)
+	broker.MinAppendRateGrace = Config.Broker.MinAppendRateGrace
 	pb.MaxReplication = int32(Config.Broker.MaxReplication)
 	stores.DisableSignedUrls = Config.Broker.DisableSignedUrls
 	stores.ForceStoreHealthCheckToHealthy = Config.Broker.ForceStoreHealthCheckToHealthy
