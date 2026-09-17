@@ -45,6 +45,24 @@ type ItemValue interface {
 	DesiredReplication() int
 }
 
+// ItemGroupValue is an optional interface which an ItemValue may implement to
+// declare a "balance group": a set of Items which the Allocator balances
+// against one another, in addition to balancing each Member's total Item count.
+//
+// The partitions of a topic are the motivating case. Balancing only total
+// counts is necessary but not sufficient: a maximum assignment can place every
+// partition of one topic -- and every one of their primaries -- onto a single
+// Member while each Member's total count remains perfectly even.
+//
+// An empty return value, or an ItemValue which does not implement this
+// interface, means the Item is ungrouped and is scheduled exactly as it was
+// before grouping existed. This is why the interface is optional: consumer
+// ShardSpecs deliberately do not implement it.
+type ItemGroupValue interface {
+	// BalanceGroup of this Item, or "" if it has none.
+	BalanceGroup() string
+}
+
 // AssignmentValue is a user-defined Assignment representation.
 type AssignmentValue interface{}
 
@@ -188,6 +206,15 @@ func LookupItem(ks *keyspace.KeySpace, id string) (Item, bool) {
 func memberAt(kv keyspace.KeyValues, i int) Member         { return kv[i].Decoded.(Member) }
 func itemAt(kv keyspace.KeyValues, i int) Item             { return kv[i].Decoded.(Item) }
 func assignmentAt(kv keyspace.KeyValues, i int) Assignment { return kv[i].Decoded.(Assignment) }
+
+// itemBalanceGroup returns the Item's declared balance group, or "" if its
+// ItemValue does not implement ItemGroupValue (see ItemGroupValue).
+func itemBalanceGroup(item Item) string {
+	if v, ok := item.ItemValue.(ItemGroupValue); ok {
+		return v.BalanceGroup()
+	}
+	return ""
+}
 
 // compareAssignment defines an order of Assignment over ItemID, MemberZone,
 // and MemberSuffix. It matches the natural key order, with the exception of

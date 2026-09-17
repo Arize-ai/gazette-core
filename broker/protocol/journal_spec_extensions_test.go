@@ -295,4 +295,29 @@ func (s *JournalSuite) TestSetOperations(c *gc.C) {
 	c.Check(SubtractJournalSpecs(model, other), gc.DeepEquals, model)
 }
 
+func (s *JournalSuite) TestBalanceGroup(c *gc.C) {
+	var spec = JournalSpec{Name: "a/journal", Replication: 3}
+	c.Check(spec.BalanceGroup(), gc.Equals, "")
+
+	// A qualified, slash-bearing value is a valid label value.
+	spec.LabelSet = MustLabelSet(labels.BalanceGroup, "tracing/spans")
+	c.Check(spec.BalanceGroup(), gc.Equals, "tracing/spans")
+	c.Check(spec.LabelSet.Validate(), gc.IsNil)
+	c.Check(ValidateSingleValueLabels(spec.LabelSet), gc.IsNil)
+
+	// An explicitly empty value is indistinguishable from no label at all,
+	// and means the journal is ungrouped.
+	spec.LabelSet = MustLabelSet(labels.BalanceGroup, "")
+	c.Check(spec.BalanceGroup(), gc.Equals, "")
+
+	// BalanceGroup is a single-value label.
+	spec.LabelSet = MustLabelSet(
+		labels.BalanceGroup, "one",
+		labels.BalanceGroup, "two",
+	)
+	c.Check(ValidateSingleValueLabels(spec.LabelSet), gc.ErrorMatches,
+		`expected single-value Label has multiple values \(index 1; label `+
+			`app.gazette.dev/balance-group value two\)`)
+}
+
 var _ = gc.Suite(&JournalSuite{})
