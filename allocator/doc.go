@@ -70,4 +70,8 @@ var (
 		Name: "gazette_allocator_primary_swap_total",
 		Help: "Cumulative number of primary assignments exchanged to rebalance a balance group. Must flatten once settled; a sustained rate indicates oscillation.",
 	})
+	allocatorPrimarySwapDeferredTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "gazette_allocator_primary_swap_deferred_total",
+		Help: "Cumulative number of convergence rounds which withheld a primary handoff to honor the minimum swap interval, and armed a wake-up for its deadline. Rising alongside a flat primary_swap_total means the correction is not progressing.",
+	})
 )

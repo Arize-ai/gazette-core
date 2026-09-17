@@ -117,13 +117,24 @@ pipeline, so handoffs are paced by two independent knobs.
 round, and `MinPrimarySwapInterval` sets the minimum wall-clock time between
 rounds which apply any.
 
-Both are needed, because a convergence round is **event-driven, not periodic**:
-`Allocate` blocks in `keyspace.WaitForRevision` until Etcd advances, and an
-applied handoff is itself a write which wakes the next round. The per-round
+Both are needed, because a convergence round is otherwise **event-driven**:
+`Allocate` blocks in `keyspace.WaitForRevisionOrWake` until Etcd advances, and
+an applied handoff is itself a write which wakes the next round. The per-round
 bound therefore limits burst size but not rate -- without an interval, handoffs
 proceed at roughly one bound per Etcd round-trip. The interval is armed only by
 handoffs actually applied, so an Item which cannot be handed off (because it is
 concurrently gaining or losing replicas) does not consume it.
+
+Being event-driven is precisely why the interval cannot simply decline and wait.
+A round which withholds a handoff writes nothing, and so produces no revision to
+wake the next round; on a settled, static set of Items nothing else writes
+either, and the remainder of a correction would wait indefinitely on unrelated
+activity -- stalling exactly when a rebalance matters most, just after a member
+restart has moved primaries in bulk. `Allocate` therefore arms the cooldown
+deadline itself, which is what makes the interval a rate limit rather than a
+bound on how much of a correction each external write is allowed to carry. Such
+a wake-up re-solves nothing: no observation intervenes, so `NetworkHash` is
+unchanged and the cached maximum assignment is reused.
 
 `itemState.buildSwapPrimaryOps` exchanges both Slots within a single
 `checkpointTxn` checkpoint, so an Item is never observed with two Slot 0

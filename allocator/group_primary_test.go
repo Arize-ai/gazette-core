@@ -3,6 +3,7 @@ package allocator
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"testing"
@@ -352,6 +353,75 @@ func TestPrimarySwapIntervalPacesHandoffs(t *testing.T) {
 	require.Equal(t, 0, swapsFor(0))
 	require.Equal(t, map[string]int{"member-A1": 2, "member-A2": 2, "member-B": 2},
 		primaryCounts(t, ctx, client, "topic-a/"))
+}
+
+// TestPrimarySwapIntervalDrainsWhenKeySpaceIsQuiet is the regression test for a
+// liveness gap in pacing. A round which withholds a handoff writes nothing, and
+// so produces no Etcd revision -- while a convergence round only ever wakes on
+// one. On a KeySpace with no other activity, which is what a static journal set
+// looks like once it has settled, nothing would ever wake the allocator to
+// apply the handoffs it deferred. The interval must pace the correction, not
+// abandon it after the first burst.
+//
+// This deliberately avoids the serveUntilIdle harnesses: they cancel the moment
+// a round reports idle, and a withholding round *is* idle, so they would tear
+// the allocator down before any cooldown could elapse.
+func TestPrimarySwapIntervalDrainsWhenKeySpaceIsQuiet(t *testing.T) {
+	var ctx, client, ks = testSetup(t)
+	require.NoError(t, insert(ctx, client, newTopicFixture(6, 2)...))
+
+	// Settle with balancing off, which marks every Assignment consistent and
+	// leaves the primaries skewed 4/2/0.
+	serveUntilIdle(t, ctx, client, ks, "")
+	require.Equal(t, map[string]int{"member-A1": 4, "member-A2": 2},
+		primaryCounts(t, ctx, client, "topic-a/"))
+
+	var resp, err = client.Get(ctx, ks.Root+MembersPrefix,
+		clientv3.WithPrefix(),
+		clientv3.WithLimit(1),
+		clientv3.WithSort(clientv3.SortByCreateRevision, clientv3.SortAscend))
+	require.NoError(t, err)
+
+	var state = NewObservedState(ks, string(resp.Kvs[0].Key), isConsistent)
+	require.NoError(t, ks.Load(ctx, client, 0))
+
+	allocCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go ks.Watch(allocCtx, client)
+
+	// A budget of one handoff per round, and an interval comfortably longer
+	// than a round takes against a live Etcd -- otherwise the cooldown would
+	// have elapsed by the time the first handoff's own write woke us, and the
+	// gap this test covers would never open. Nothing but the allocator writes
+	// to Etcd from here, so its own cooldown wakeup is the only thing which can
+	// carry the correction past that first handoff.
+	var exited = make(chan error, 1)
+	go func() {
+		exited <- Allocate(AllocateArgs{
+			Context:                 allocCtx,
+			Etcd:                    client,
+			State:                   state,
+			MaxPrimarySwapsPerRound: 1,
+			MinPrimarySwapInterval:  time.Second,
+		})
+	}()
+
+	var want = map[string]int{"member-A1": 2, "member-A2": 2, "member-B": 2}
+	var last map[string]int
+
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+		if last = primaryCounts(t, ctx, client, "topic-a/"); maps.Equal(last, want) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	select {
+	case err := <-exited:
+		require.NoError(t, err, "allocator exited before the correction completed")
+	default:
+	}
+	require.Equal(t, want, last, "primary handoffs stalled short of a fair spread")
 }
 
 // TestPrimarySwapAppliedCountArmsCooldown verifies that converge reports only
