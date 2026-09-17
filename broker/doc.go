@@ -24,4 +24,9 @@ var (
 		Name: "gazette_write_head",
 		Help: "Current write head of the journal (i.e., next byte offset to be written).",
 	}, []string{"journal"})
+	appendFlowUnderflowTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "gazette_append_flow_control_underflow_total",
+		Help: "Total Append RPCs aborted for failing to sustain MinAppendRate, by whether " +
+			"the broker was waiting on its client or was busy in its own pipeline.",
+	}, []string{"stalled"})
 )
