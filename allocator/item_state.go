@@ -355,6 +355,15 @@ func (s *itemState) creditGroupPrimary(ind int, delta int32) {
 	}
 }
 
+// declineSwap records why a proposed primary handoff was refused, and reports
+// that it was. Most declines are expected and self-correcting -- an Item in
+// motion is simply re-proposed on a later round -- but skew which fails to
+// close needs them attributed, which no other metric does.
+func declineSwap(reason string) bool {
+	allocatorPrimarySwapDeclinedTotal.WithLabelValues(reason).Inc()
+	return false
+}
+
 // buildSwapPrimaryOps exchanges the Slots of the Item's current primary and
 // the staying Assignment of s.desiredPrimary, and reports whether it did so.
 //
@@ -369,14 +378,16 @@ func (s *itemState) creditGroupPrimary(ind int, delta int32) {
 // so no key is both put and deleted -- which is what makes the exchange
 // expressible as a single transaction at all.
 func (s *itemState) buildSwapPrimaryOps(txn checkpointTxn) bool {
-	if s.desiredPrimary == (memberID{}) || len(s.reorder) == 0 {
-		return false
+	if s.desiredPrimary == (memberID{}) {
+		return false // No handoff was proposed for this Item.
+	} else if len(s.reorder) == 0 {
+		return declineSwap("no_replicas")
 	}
 	var cur = assignmentAt(s.reorder, 0)
 	if cur.Slot != 0 {
-		return false // No current primary: constrainReorders promotes instead.
+		return declineSwap("no_primary") // constrainReorders promotes instead.
 	} else if cur.MemberZone == s.desiredPrimary.zone && cur.MemberSuffix == s.desiredPrimary.suffix {
-		return false // Already where we want it.
+		return declineSwap("already_primary")
 	}
 	var item = itemAt(s.global.Items, s.item)
 
@@ -386,7 +397,7 @@ func (s *itemState) buildSwapPrimaryOps(txn checkpointTxn) bool {
 		if next.MemberZone != s.desiredPrimary.zone || next.MemberSuffix != s.desiredPrimary.suffix {
 			continue
 		} else if !s.global.IsConsistent(item, s.reorder[k], s.current) {
-			return false // Never promote a replica which isn't caught up.
+			return declineSwap("inconsistent") // Never promote a replica which isn't caught up.
 		}
 		var curKV, nextKV = s.reorder[0], s.reorder[k]
 		cur.Slot, next.Slot = next.Slot, cur.Slot
@@ -413,7 +424,7 @@ func (s *itemState) buildSwapPrimaryOps(txn checkpointTxn) bool {
 		s.swapsApplied++
 		return true
 	}
-	return false // The desired Member is no longer a staying replica.
+	return declineSwap("not_staying")
 }
 
 // buildPackOps adds operations to |txn| which shift the Slot of up to one
@@ -455,11 +466,15 @@ func (s *itemState) constrainAndBuildOps(txn checkpointTxn) error {
 
 	// An Item which is otherwise moving this round is left alone: it has no
 	// spare Slot bookkeeping to give, and deferring is free hysteresis, since
-	// the handoff is re-proposed on a later round if still worthwhile.
-	if len(s.add) == 0 && len(s.remove) == 0 {
-		if !s.buildSwapPrimaryOps(txn) {
-			s.buildPackOps(txn)
+	// the handoff is re-proposed on a later round if still worthwhile. This is
+	// where a proposal is most often refused, so it is attributed here rather
+	// than inside buildSwapPrimaryOps, which never sees the Item at all.
+	if len(s.add) != 0 || len(s.remove) != 0 {
+		if s.desiredPrimary != (memberID{}) {
+			declineSwap("in_motion")
 		}
+	} else if !s.buildSwapPrimaryOps(txn) {
+		s.buildPackOps(txn)
 	}
 	return txn.Checkpoint()
 }

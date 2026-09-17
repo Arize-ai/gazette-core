@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
@@ -476,6 +477,139 @@ func TestPrimarySwapAppliedCountArmsCooldown(t *testing.T) {
 		clientv3.OpPut("/root/assign/g/i1#zone-a#mA#1", "consistent"),
 		clientv3.OpPut("/root/assign/g/i1#zone-b#mB#0", "consistent"),
 	}, txn.ops)
+}
+
+// declineReasons are every reason converge may refuse a proposed handoff. The
+// test below asserts each is reachable and that a decline is attributed to
+// exactly one of them -- a misattributed reason is worse than none, since the
+// whole point is to name the cause of skew which will not close.
+var declineReasons = []string{
+	"in_motion", "no_replicas", "no_primary",
+	"already_primary", "inconsistent", "not_staying",
+}
+
+func declineCounts() map[string]float64 {
+	var out = make(map[string]float64, len(declineReasons))
+	for _, r := range declineReasons {
+		out[r] = testutil.ToFloat64(allocatorPrimarySwapDeclinedTotal.WithLabelValues(r))
+	}
+	return out
+}
+
+// TestPrimarySwapDeclineReasons covers the attribution of every refusal. Note
+// that "in_motion" is refused by constrainAndBuildOps and never reaches
+// buildSwapPrimaryOps at all, which is why it is counted at the caller.
+func TestPrimarySwapDeclineReasons(t *testing.T) {
+	// Assignments beyond the members, the desired state to converge toward,
+	// and the Member proposed to take over g/i1's primary.
+	for _, tc := range []struct {
+		reason   string
+		assign   []string
+		desired  []Assignment
+		proposed memberID
+	}{
+		{
+			reason: "not_staying", // mC replicates nothing.
+			assign: []string{
+				"/root/assign/g/i1#zone-a#mA#0", `consistent`,
+				"/root/assign/g/i1#zone-b#mB#1", `consistent`,
+			},
+			desired: []Assignment{
+				{ItemID: "g/i1", MemberZone: "zone-a", MemberSuffix: "mA"},
+				{ItemID: "g/i1", MemberZone: "zone-b", MemberSuffix: "mB"},
+			},
+			proposed: memberID{zone: "zone-c", suffix: "mC"},
+		},
+		{
+			reason: "inconsistent", // mB replicates it, but is not caught up.
+			assign: []string{
+				"/root/assign/g/i1#zone-a#mA#0", `consistent`,
+				// An empty value decodes as a replica which is not caught
+				// up; anything else the test decoder rejects outright.
+				"/root/assign/g/i1#zone-b#mB#1", ``,
+			},
+			desired: []Assignment{
+				{ItemID: "g/i1", MemberZone: "zone-a", MemberSuffix: "mA"},
+				{ItemID: "g/i1", MemberZone: "zone-b", MemberSuffix: "mB"},
+			},
+			proposed: memberID{zone: "zone-b", suffix: "mB"},
+		},
+		{
+			reason: "in_motion", // Gaining mC this round.
+			assign: []string{
+				"/root/assign/g/i1#zone-a#mA#0", `consistent`,
+				"/root/assign/g/i1#zone-b#mB#1", `consistent`,
+			},
+			desired: []Assignment{
+				{ItemID: "g/i1", MemberZone: "zone-a", MemberSuffix: "mA"},
+				{ItemID: "g/i1", MemberZone: "zone-b", MemberSuffix: "mB"},
+				{ItemID: "g/i1", MemberZone: "zone-c", MemberSuffix: "mC"},
+			},
+			proposed: memberID{zone: "zone-b", suffix: "mB"},
+		},
+		{
+			reason: "already_primary", // mA already holds Slot 0.
+			assign: []string{
+				"/root/assign/g/i1#zone-a#mA#0", `consistent`,
+				"/root/assign/g/i1#zone-b#mB#1", `consistent`,
+			},
+			desired: []Assignment{
+				{ItemID: "g/i1", MemberZone: "zone-a", MemberSuffix: "mA"},
+				{ItemID: "g/i1", MemberZone: "zone-b", MemberSuffix: "mB"},
+			},
+			proposed: memberID{zone: "zone-a", suffix: "mA"},
+		},
+		{
+			reason: "no_primary", // No Slot 0 among the stayers.
+			assign: []string{
+				"/root/assign/g/i1#zone-a#mA#1", `consistent`,
+				"/root/assign/g/i1#zone-b#mB#2", `consistent`,
+			},
+			desired: []Assignment{
+				{ItemID: "g/i1", MemberZone: "zone-a", MemberSuffix: "mA"},
+				{ItemID: "g/i1", MemberZone: "zone-b", MemberSuffix: "mB"},
+			},
+			proposed: memberID{zone: "zone-b", suffix: "mB"},
+		},
+		{
+			reason:   "no_replicas", // The Item has no Assignments at all.
+			assign:   nil,
+			desired:  nil,
+			proposed: memberID{zone: "zone-b", suffix: "mB"},
+		},
+	} {
+		t.Run(tc.reason, func(t *testing.T) {
+			var ctx, client, ks = testSetup(t)
+
+			var fixture = []string{
+				"/root/members/zone-a#mA", `{"R": 20}`,
+				"/root/members/zone-b#mB", `{"R": 20}`,
+				"/root/members/zone-c#mC", `{"R": 20}`,
+				"/root/items/g/i1", `{"R": 2, "G": "g"}`,
+			}
+			require.NoError(t, insert(ctx, client, append(fixture, tc.assign...)...))
+
+			var state = NewObservedState(ks, MemberKey(ks, "zone-a", "mA"), isConsistent)
+			require.NoError(t, ks.Load(ctx, client, 0))
+
+			var before = declineCounts()
+			var txn mockTxnBuilder
+			var applied, err = converge(&txn, state, tc.desired, true,
+				map[string]memberID{"g/i1": tc.proposed})
+			var after = declineCounts()
+
+			require.NoError(t, err)
+			require.Zero(t, applied, "a declined handoff must not arm the cooldown")
+
+			for _, r := range declineReasons {
+				var want float64
+				if r == tc.reason {
+					want = 1
+				}
+				require.Equal(t, want, after[r]-before[r], "reason %q", r)
+			}
+		})
+	}
 }
 
 // totalPrimaryMoves counts primaries held by Members which the unbalanced

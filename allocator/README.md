@@ -136,6 +136,23 @@ bound on how much of a correction each external write is allowed to carry. Such
 a wake-up re-solves nothing: no observation intervenes, so `NetworkHash` is
 unchanged and the cached maximum assignment is reused.
 
+### Diagnosing a handoff which does not happen
+
+A proposal may be refused, and most refusals are expected and self-correcting:
+an Item which is concurrently gaining or losing replicas has no spare Slot
+bookkeeping to give, so it is skipped and re-proposed on a later round.
+`gazette_allocator_primary_swap_declined_total` attributes each refusal by
+`reason`, and together with `..._primary_swap_total` accounts for every
+proposal -- so skew which will not close names its own cause rather than
+requiring debug logs.
+
+`in_motion` dominating just after a topology change is normal, and is counted
+in `constrainAndBuildOps` rather than `buildSwapPrimaryOps`, which never sees
+such an Item. `inconsistent` or `not_staying` persisting while
+`balance_group_primary_spread_max` stays above one is not: it means the
+replicas which could take over are not catching up, or the group's reachable
+Members form a tight cut which no handoff can improve.
+
 `itemState.buildSwapPrimaryOps` exchanges both Slots within a single
 `checkpointTxn` checkpoint, so an Item is never observed with two Slot 0
 Assignments. This is possible in one transaction because an Assignment key

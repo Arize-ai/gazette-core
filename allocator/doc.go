@@ -70,6 +70,10 @@ var (
 		Name: "gazette_allocator_primary_swap_total",
 		Help: "Cumulative number of primary assignments exchanged to rebalance a balance group. Must flatten once settled; a sustained rate indicates oscillation.",
 	})
+	allocatorPrimarySwapDeclinedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "gazette_allocator_primary_swap_declined_total",
+		Help: "Cumulative number of proposed primary handoffs which converge refused, by reason. With primary_swap_total this accounts for every proposal, so skew which persists while this rises names its own cause.",
+	}, []string{"reason"})
 	allocatorPrimarySwapDeferredTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "gazette_allocator_primary_swap_deferred_total",
 		Help: "Cumulative number of convergence rounds which withheld a primary handoff to honor the minimum swap interval, and armed a wake-up for its deadline. Rising alongside a flat primary_swap_total means the correction is not progressing.",
