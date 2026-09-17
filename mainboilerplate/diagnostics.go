@@ -28,8 +28,18 @@ func InitDiagnosticsAndRecover(cfg DiagnosticsConfig) func() {
 	// Turn on histograms for client & server RPCs. These can be very helpful to
 	// have around, but are also expensive to track at scale. You may want to
 	// consider rules which selectively discard some histograms at scrape time.
-	grpc_prometheus.EnableHandlingTimeHistogram()
-	grpc_prometheus.EnableClientHandlingTimeHistogram()
+	//
+	// Extend the default buckets (which top out at 10s) with coarser bounds up
+	// to 120s. Some operations, notably primary Append RPCs that synchronously
+	// compress large fragments, can exceed 10s; without these bounds their
+	// latency is indistinguishable within the +Inf bucket.
+	var buckets = []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120}
+	grpc_prometheus.EnableHandlingTimeHistogram(
+		grpc_prometheus.WithHistogramBuckets(buckets),
+	)
+	grpc_prometheus.EnableClientHandlingTimeHistogram(
+		grpc_prometheus.WithHistogramBuckets(buckets),
+	)
 
 	// Package "net/http/pprof" serves /debug/pprof/.
 	// Package "expvar" serves /debug/vars
@@ -38,6 +48,9 @@ func InitDiagnosticsAndRecover(cfg DiagnosticsConfig) func() {
 	http.HandleFunc("/debug/ready", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
+	// Track capacity of the filesystem backing os.TempDir() (typically /tmp),
+	// including space held by open-but-unlinked journal spool files.
+	RegisterTmpFSMetrics()
 	// Serve Prometheus metrics at /debug/metrics.
 	http.Handle("/debug/metrics", promhttp.Handler())
 

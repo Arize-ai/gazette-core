@@ -38,6 +38,13 @@ It provides the core scheduling intelligence that keeps Gazette services highly 
 ### Flow Network
 - `sparseFlowNetwork`: Models allocation as maximum flow problem
 - Uses `sparse_push_relabel` algorithm to solve optimal assignments
+- Item IDs sharing a logical "group" (eg partitions of a common topic, via
+  `itemGroup`) are additionally balanced across Members *within* their group,
+  through an intervening layer of Group-Member nodes -- see below.
+- `primaryFlowNetwork`: A second, much smaller max-flow network solved every
+  convergence round, which independently balances *primary* (Slot 0)
+  Assignments of a tracked group across Members -- see "Primary balancing"
+  below.
 
 ## Brief Architecture
 
@@ -58,3 +65,112 @@ The algorithm prioritizes:
 - **Balance**: Even distribution across Members and zones  
 - **Availability**: Maintains replication during reassignments
 - **Performance**: Incremental updates scale linearly with Items
+
+## Group-aware balancing
+
+Overall load balancing is necessary but not sufficient: a cluster's *total*
+load can be perfectly even while a specific set of related Items -- eg the
+16 partitions of one topic -- pile onto just one or two Members. This is
+especially likely under repeated topology churn (eg a rolling Kubernetes
+Deployment restart, where every Member gets a brand-new random identity):
+each individual Member swap only reconsiders that Member's own orphaned
+Items, so imbalance among any one logical group can accumulate indefinitely
+even though the flow network is always re-solved to a legitimate maximum
+assignment.
+
+`itemGroup` infers a logical group from an Item ID: if the final
+`/`-delimited path segment ends in decimal digits, the group is the ID with
+that segment removed (`a-topic/part-003` groups with `a-topic`); otherwise
+the ID is its own singleton group. Groups with only one Item are never
+specially treated, since a single Item cannot itself cluster within a zone.
+
+For every other (multi-Item) group, `sparseFlowNetwork` inserts a
+**Group-Member** node for each `(zone, group, Member)` triple, sitting
+between Zone-Item and Member nodes. Every Zone-Item of that group, within
+that zone, is routed through the Group-Member node of its target Member
+rather than directly to the Member. The Group-Member's single outgoing arc
+is capacity-bound to that Member's fair share of the group within the zone
+(`ceil(groupDemand / zoneMemberCount)`), enforcing balance as a hard flow
+constraint rather than a mere ordering preference. Exactly like Member
+fair-share (`buildMemberArc`), this cap is relaxed under sufficient network
+"pressure" (see `groupMemberOverflowThreshold`) so that group fairness never
+prevents an otherwise-achievable maximum assignment.
+
+`groupDemand` is the group's Item *count* in the common multi-zone case,
+since each Item ordinarily places just one replica per zone. But with only a
+single zone, every replica of every Item -- not just one -- must land there,
+so `groupDemand` is instead the group's total replication slots (`Item count
+* DesiredReplication`). Using the raw Item count unconditionally understates
+demand for `R > 1` in a single-zone cluster, which sets the cap far too low;
+it's relaxed under pressure almost immediately, and because that relaxation
+kicks in per-Group-Member rather than uniformly, one arbitrary Member ends up
+absorbing the bulk of the group instead of the load spreading evenly.
+
+## Primary balancing
+
+Group-aware balancing (above) keeps overall replica *membership* even across
+Members, but replica membership alone doesn't guarantee an even spread of
+*primaries* (the Slot 0 Assignment of each Item, which typically bears extra
+load -- eg it alone accepts writes). Two groups can have perfectly balanced
+membership while one Member happens to hold a disproportionate share of
+primaries, since which replica is primary is a largely independent decision
+from which Members replicate an Item at all.
+
+`primaryFlowNetwork` (`primary_flow_network.go`) solves this as its own,
+much smaller max-flow problem, run once per convergence round for every
+tracked multi-Item group:
+
+	Source -> Item (cap 1) -> Group-Member (fair-share cap, relaxed) -> Sink
+
+Every Item of a tracked group contributes one unit of source flow, which
+must land on one of the Item's *current* replica Members -- this network
+only ever chooses *which* replica is primary, never *which* Members
+replicate the Item (that remains `sparseFlowNetwork`'s job, and is treated
+as fixed input here). A Group-Member's arc to the Sink is capacity-bound to
+that Member's fair share of the group's primaries, relaxed under pressure
+exactly as `buildGroupMemberArc` relaxes overall membership, so a complete
+assignment (one primary per Item) is always reached.
+
+`itemState.constrainReorders` consults the resulting `desiredPrimary`
+selection when deciding which replica to promote, but only follows it once
+the desired replica is itself consistent -- an inconsistent replica is never
+promoted over a consistent current primary, preserving availability over
+strict fairness.
+
+Because the network is re-solved from scratch every round based on the
+*current* primary assignment (there's no persistent state or caching, unlike
+`sparseFlowNetwork`'s NetworkHash-gated re-solve), the arcs from each Item
+node must deterministically prefer that Item's current primary, or the
+allocator can cycle indefinitely -- see the "current primary" rotation logic
+in `Arcs()`, which counteracts `sparse_push_relabel`'s node-based Arc-order
+shift specifically to guarantee this network is a stable fixed point once
+balanced.
+
+That same "prefer current primary" stability, however, means the
+Group-Member fair-share cap must be *tight* -- summing to exactly the
+group's Item count -- rather than a uniform ceiling applied to every
+Member (as `buildGroupMemberArc` above uses). A uniform ceiling (eg
+`ceil(16/3)=6` given to all 3 Members, summing to 18 against only 16
+available) leaves slack that lets an already-skewed split (eg 4/6/6)
+satisfy every Member's cap without ever exceeding it, so the solver finds
+it as *a* valid maximum flow and stops -- it has no capacity pressure left
+to discover the fairer 5/5/6.
+
+A precise even split isn't always achievable, though: a Member may
+structurally be unable to reach its share no matter how primaries are
+chosen, simply because it doesn't replicate enough of the group's Items
+to begin with (eg a recently-scaled Member still catching up on replica
+membership elsewhere). `groupMemberCaps` accounts for this by
+"water-filling" each Member's cap against its actual reachability (how
+many of the group's Items it replicates at all -- an upper bound on how
+many it could ever be primary for): any Member short of an even split of
+the *remaining* demand is capped at its reachable count, and its
+shortfall folds back into the pool redistributed evenly among the
+Members still able to accept more, repeating until stable. This -- and
+not push/relabel's dynamic, pressure-triggered relaxation to unbounded
+capacity -- is what resolves an unreachable Member's shortfall, since
+that relaxation has no deterministic tie-break for *which* of several
+eligible Members should absorb the overflow, and previously could flap
+between equally valid choices round over round, exactly like the arc-shift
+oscillation above but one layer higher (across Members instead of within
+a single Item's own candidates).
