@@ -5,12 +5,14 @@ import (
 	"errors"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.gazette.dev/core/broker/fragment"
 	pb "go.gazette.dev/core/broker/protocol"
 	"go.gazette.dev/core/broker/stores"
 	"go.gazette.dev/core/etcdtest"
+	"google.golang.org/grpc/metadata"
 )
 
 func TestAppendSingle(t *testing.T) {
@@ -400,3 +402,99 @@ func TestAppendProxyCases(t *testing.T) {
 }
 
 func TestMain(m *testing.M) { etcdtest.TestMainWithEtcd(m) }
+
+// TestProxyAppendStats asserts the accounting of a proxied Append, in
+// particular that time waiting on our own client is not confused with time
+// spent pushing to the primary -- the distinction the stats exist to draw.
+func TestProxyAppendStats(t *testing.T) {
+	var ctx, etcd = pb.WithDispatchDefault(context.Background()), etcdtest.TestClient()
+	defer etcdtest.Cleanup()
+	ctx = pb.WithClaims(ctx, pb.Claims{Capability: pb.Capability_APPEND})
+
+	var broker = newTestBroker(t, etcd, pb.ProcessSpec_ID{Zone: "local", Suffix: "broker"})
+	var peer = newMockBroker(t, etcd, pb.ProcessSpec_ID{Zone: "peer", Suffix: "broker"})
+	setTestJournal(broker, pb.JournalSpec{Name: "a/journal", Replication: 1}, peer.id)
+
+	var hdr = broker.header("a/journal")
+	hdr.ProcessId = peer.id
+
+	// Drive a synthetic clock: every read of timeNow advances it 10ms, and each
+	// read from our client costs a further 200ms. Every measured interval is
+	// then exactly predictable, and a send/recv transposition is visible.
+	defer func(f func() time.Time) { timeNow = f }(timeNow)
+
+	var now int64
+	timeNow = func() time.Time {
+		now += 10
+		return time.Unix(0, now*int64(time.Millisecond))
+	}
+	var stream = &fakeServerStream{
+		ctx:  ctx,
+		recv: []pb.AppendRequest{{Content: []byte("foobar")}, {}},
+		onRecv: func() {
+			now += 200 // Our client is slow.
+		},
+	}
+
+	// Peer reads the relayed stream and responds.
+	go func() {
+		require.Equal(t, pb.AppendRequest{Journal: "a/journal", Header: hdr}, <-peer.AppendReqCh)
+		require.Equal(t, pb.AppendRequest{Content: []byte("foobar")}, <-peer.AppendReqCh)
+		require.Equal(t, pb.AppendRequest{}, <-peer.AppendReqCh)
+		require.Equal(t, io.EOF, <-peer.ReadLoopErrCh)
+		peer.AppendRespCh <- pb.AppendResponse{Commit: &pb.Fragment{Begin: 1234, End: 5678}}
+	}()
+
+	var pxy proxyAppendStats
+	require.NoError(t, proxyAppend(stream,
+		pb.AppendRequest{Journal: "a/journal", Header: hdr}, broker.client(), &pxy))
+
+	require.Equal(t, proxyAppendStats{
+		ContentBytes: 6,
+		Chunks:       3, // Opening request, content, and the empty commit chunk.
+		OpenMillis:   10,
+		SendMillis:   30,
+		RecvMillis:   630,
+		RespMillis:   10,
+		TotalMillis:  760,
+		Stalled:      "client",
+	}, pxy)
+
+	require.Equal(t, []pb.AppendResponse{
+		{Commit: &pb.Fragment{Begin: 1234, End: 5678}},
+	}, stream.sent)
+
+	broker.cleanup()
+	peer.Cleanup()
+}
+
+// fakeServerStream scripts a client-side Append stream, for direct tests of
+// proxyAppend which don't involve a real client.
+type fakeServerStream struct {
+	ctx    context.Context
+	recv   []pb.AppendRequest // Handed out in order, then io.EOF.
+	sent   []pb.AppendResponse
+	onRecv func() // Called on each RecvMsg, before it returns.
+}
+
+func (s *fakeServerStream) SetHeader(metadata.MD) error  { return nil }
+func (s *fakeServerStream) SendHeader(metadata.MD) error { return nil }
+func (s *fakeServerStream) SetTrailer(metadata.MD)       {}
+func (s *fakeServerStream) Context() context.Context     { return s.ctx }
+
+func (s *fakeServerStream) SendMsg(m interface{}) error {
+	s.sent = append(s.sent, *m.(*pb.AppendResponse))
+	return nil
+}
+
+func (s *fakeServerStream) RecvMsg(m interface{}) error {
+	if s.onRecv != nil {
+		s.onRecv()
+	}
+	if len(s.recv) == 0 {
+		return io.EOF
+	}
+	*m.(*pb.AppendRequest) = s.recv[0]
+	s.recv = s.recv[1:]
+	return nil
+}
