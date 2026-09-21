@@ -172,6 +172,6 @@ func TestFlowControlWindowResolution(t *testing.T) {
 		require.Equal(t, tc.expectConn == 0 && tc.expectStr == 0,
 			flowControlServerOptions() == nil, tc.description)
 		require.Equal(t, tc.expectConn == 0 && tc.expectStr == 0,
-			FlowControlDialOptions() == nil, tc.description)
+			flowControlDialOptions() == nil, tc.description)
 	}
 }

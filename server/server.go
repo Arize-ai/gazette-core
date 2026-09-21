@@ -28,6 +28,11 @@ import (
 // and gRPC applies dynamic (BDP-estimated) sizing, growing windows with the
 // measured bandwidth-delay product.
 //
+// These govern the broker's own server and its peer connections only. They are
+// assigned by `gazette serve`, and so are zero in every other process: client
+// dials in mainboilerplate are configured independently and statically, and
+// must not be made to track these (see clientFlowControlOptions there).
+//
 // Note the two are coupled: configuring EITHER one disables dynamic sizing for
 // streams as well as connections, falling back to a 64KB static default for
 // whichever is left unset. So "large connection window with a dynamically sized
@@ -85,10 +90,9 @@ func flowControlServerOptions() []grpc.ServerOption {
 	}
 }
 
-// FlowControlDialOptions returns the window options to configure for a client
-// connection, which is none at all when dynamic sizing is desired. It's
-// exported so that clients dialing brokers match their configuration.
-func FlowControlDialOptions() []grpc.DialOption {
+// flowControlDialOptions returns the window options to configure for the
+// loopback ClientConn, which is none at all when dynamic sizing is desired.
+func flowControlDialOptions() []grpc.DialOption {
 	var conn, stream = flowControlWindows()
 	if conn == 0 && stream == 0 {
 		return nil
@@ -247,7 +251,7 @@ func New(
 			// Instrument client for gRPC metric collection.
 			grpc.WithUnaryInterceptor(grpc_prometheus.UnaryClientInterceptor),
 			grpc.WithStreamInterceptor(grpc_prometheus.StreamClientInterceptor),
-		}, FlowControlDialOptions()...)...,
+		}, flowControlDialOptions()...)...,
 	)
 
 	if err != nil {
