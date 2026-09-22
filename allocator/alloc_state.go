@@ -60,6 +60,35 @@ type State struct {
 	// (CreateRevision), so that the oldest exiting members drain first.
 	// Shares cardinality with |Members|.
 	ShedCapacity []int
+
+	// Balance groups declared by Items (see ItemGroupValue). GroupNames indexes
+	// groups densely, and index zero is the "" sentinel of ungrouped Items --
+	// so len(GroupNames) == 1 means no Item declared a group at all, and every
+	// group-aware code path is a no-op.
+	GroupNames []string
+	// Dense group index of each Item. Shares cardinality with |Items|.
+	ItemGroups []int32
+	// Number of Items of each group. Index zero counts ungrouped Items.
+	// Shares cardinality with |GroupNames|.
+	GroupItemCount []int
+
+	// Counts of primary (Slot 0) Assignments, and of Assignments of any Slot,
+	// by group and Member. Both are row-major matrices indexed
+	// [group*len(Members) + member], and are empty when no group is declared.
+	//
+	// GroupMemberReach upper-bounds how many of a group's primaries a Member
+	// could ever hold, since a Member can only be primary for an Item it
+	// already replicates.
+	GroupPrimaryCount []int32
+	GroupMemberReach  []int32
+	// Largest difference between the most and least primary Assignments of a
+	// single group held by any Member which replicates part of that group.
+	// Zero when no group is declared. This is the gate for primary rebalancing:
+	// a spread of one or less is already fair.
+	MaxGroupPrimarySpread int
+
+	// Reused index of group name to dense group index, rebuilt on each observe.
+	groupIndex map[string]int32
 }
 
 // NewObservedState returns a *State instance which extracts and updates itself
@@ -139,11 +168,59 @@ func (s *State) observe() {
 		s.LocalMemberInd = ind
 	}
 
+	// Walk Items to assign each a dense balance-group index. Index zero is the
+	// ungrouped sentinel, and remains the only entry when no Item declares a
+	// group -- in which case the per-group matrices below stay empty and no
+	// group-aware behavior engages.
+	if s.groupIndex == nil {
+		s.groupIndex = make(map[string]int32)
+	} else {
+		clear(s.groupIndex)
+	}
+	s.GroupNames = append(s.GroupNames[:0], "")
+	s.GroupItemCount = append(s.GroupItemCount[:0], 0)
+
+	if cap(s.ItemGroups) < len(s.Items) {
+		s.ItemGroups = make([]int32, len(s.Items))
+	} else {
+		s.ItemGroups = s.ItemGroups[:len(s.Items)]
+	}
+	for i := range s.Items {
+		var gi int32 // Zero: ungrouped.
+
+		if group := itemBalanceGroup(itemAt(s.Items, i)); group != "" {
+			var ok bool
+			if gi, ok = s.groupIndex[group]; !ok {
+				gi = int32(len(s.GroupNames))
+				s.groupIndex[group] = gi
+				s.GroupNames = append(s.GroupNames, group)
+				s.GroupItemCount = append(s.GroupItemCount, 0)
+			}
+		}
+		s.ItemGroups[i] = gi
+		s.GroupItemCount[gi]++
+	}
+
+	var groupCells int
+	if len(s.GroupNames) != 1 {
+		groupCells = len(s.GroupNames) * len(s.Members)
+	}
+	if cap(s.GroupPrimaryCount) < groupCells {
+		s.GroupPrimaryCount = make([]int32, groupCells)
+		s.GroupMemberReach = make([]int32, groupCells)
+	} else {
+		s.GroupPrimaryCount = s.GroupPrimaryCount[:groupCells]
+		s.GroupMemberReach = s.GroupMemberReach[:groupCells]
+		clear(s.GroupPrimaryCount)
+		clear(s.GroupMemberReach)
+	}
+
 	// Left-join Items with their Assignments to:
 	//   * Initialize |ItemSlots|.
 	//   * Initialize |NetworkHash|.
 	//   * Collect Items and Assignments which map to the |LocalKey| Member.
 	//   * Accumulate per-Member counts of primary and total Assignments.
+	//   * Accumulate per-(group, Member) counts of primary Assignments and reach.
 	var it = LeftJoin{
 		LenL: len(s.Items),
 		LenR: len(s.Assignments),
@@ -177,9 +254,19 @@ func (s *State) observe() {
 					s.MemberPrimaryCount[ind]++
 				}
 				s.MemberTotalCount[ind]++
+
+				if gi := s.ItemGroups[cur.Left]; gi != 0 {
+					var cell = int(gi)*len(s.Members) + ind
+					if a.Slot == 0 {
+						s.GroupPrimaryCount[cell]++
+					}
+					s.GroupMemberReach[cell]++
+				}
 			}
 		}
 	}
+
+	s.MaxGroupPrimarySpread = s.maxGroupPrimarySpread()
 
 	// Compute ShedCapacity for exiting members. ShedCapacity is granted to
 	// exiting members, oldest first, up to each member's ItemLimit.
@@ -259,6 +346,87 @@ func (s *State) memberEffectiveLimit(ind int) int {
 // memberLoadRatio maps |assignment| to a Member and, if found, returns the
 // ratio of the Member's index in |counts| to the Member's effective item
 // limit. If the Member is not found, infinity is returned.
+// maxGroupPrimarySpread returns the largest difference between the most and
+// least primary Assignments of a single group held by any Member which
+// replicates part of that group. Members replicating none of a group are
+// excluded: they can never hold its primary, so counting their zero would
+// report a spread that no reassignment could close.
+func (s *State) maxGroupPrimarySpread() int {
+	var out int
+	for gi := int32(1); gi != int32(len(s.GroupNames)); gi++ {
+		out = max(out, s.groupPrimarySpread(gi))
+	}
+	return out
+}
+
+// groupPrimarySpread returns the difference between the most and least primary
+// Assignments of group |gi| held by any Member which replicates part of it.
+func (s *State) groupPrimarySpread(gi int32) int {
+	var lo, hi = math.MaxInt, 0
+
+	for m := range s.Members {
+		if s.GroupMemberReach[s.groupCell(gi, m)] == 0 {
+			continue
+		}
+		var c = int(s.GroupPrimaryCount[s.groupCell(gi, m)])
+		lo, hi = min(lo, c), max(hi, c)
+	}
+	if lo == math.MaxInt {
+		return 0 // No Member replicates the group.
+	}
+	return hi - lo
+}
+
+// groupCell indexes the row-major per-(group, Member) matrices. Group zero is
+// the ungrouped sentinel, which those matrices never track.
+func (s *State) groupCell(gi int32, member int) int {
+	if gi == 0 {
+		panic("ungrouped Items have no group cell")
+	}
+	return int(gi)*len(s.Members) + member
+}
+
+// memberPrimaryRatio is the ratio of a Member's primary Assignments to its
+// effective item limit. It mirrors memberLoadRatio, but is indexed by Member
+// rather than derived from an existing Assignment, so it may be applied to an
+// Assignment which does not exist yet.
+func (s *State) memberPrimaryRatio(member int) float32 {
+	if limit := s.memberEffectiveLimit(member); limit > 0 {
+		return float32(s.MemberPrimaryCount[member]) / float32(limit)
+	}
+	return math.MaxFloat32
+}
+
+// maxGroupPrimaryShare returns the largest ratio of a Member's primary
+// Assignments of one group to an even share of that group's primaries. One is
+// perfectly fair; a group whose primaries all sit on one of three eligible
+// Members reads as three.
+func (s *State) maxGroupPrimaryShare() float64 {
+	var out float64
+
+	for gi := 1; gi != len(s.GroupNames); gi++ {
+		var reaching, hi int
+
+		for m := range s.Members {
+			if s.GroupMemberReach[s.groupCell(int32(gi), m)] == 0 {
+				continue
+			}
+			reaching++
+			hi = max(hi, int(s.GroupPrimaryCount[s.groupCell(int32(gi), m)]))
+		}
+		// Each Item has exactly one primary, so a group's primaries number its
+		// Items, and an even share spreads them over the Members able to hold one.
+		if reaching == 0 {
+			continue
+		} else if even := float64(s.GroupItemCount[gi]) / float64(reaching); even != 0 {
+			if share := float64(hi) / even; share > out {
+				out = share
+			}
+		}
+	}
+	return out
+}
+
 func (s *State) memberLoadRatio(assignment keyspace.KeyValue, counts []int) float32 {
 	var a = assignment.Decoded.(Assignment)
 

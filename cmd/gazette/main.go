@@ -45,9 +45,14 @@ var Config = new(struct {
 		MaxAppendRate                  uint32        `long:"max-append-rate" env:"MAX_APPEND_RATE" default:"0" description:"Max rate (in bytes-per-sec) that any one journal may be appended to. If zero, there is no max rate"`
 		MaxReplication                 uint32        `long:"max-replication" env:"MAX_REPLICATION" default:"9" description:"Maximum effective replication of any one journal, which upper-bounds its stated replication."`
 		MinAppendRate                  uint32        `long:"min-append-rate" env:"MIN_APPEND_RATE" default:"65536" description:"Min rate (in bytes-per-sec) at which a client may stream Append RPC content. RPCs unable to sustain this rate are aborted"`
+		MinAppendRateGrace             time.Duration `long:"min-append-rate-grace" env:"MIN_APPEND_RATE_GRACE" default:"1s" description:"Window over which an Append RPC client may deliver no data before it's aborted for failing min-append-rate. Raise it to tolerate bursty writers which hold an append open between bursts"`
+		InitialWindowSize              int32         `long:"initial-window-size" env:"INITIAL_WINDOW_SIZE" default:"0" description:"HTTP/2 stream flow control window, in bytes. Zero (with initial-conn-window-size also zero) uses gRPC's dynamic BDP window sizing"`
+		InitialConnWindowSize          int32         `long:"initial-conn-window-size" env:"INITIAL_CONN_WINDOW_SIZE" default:"0" description:"HTTP/2 connection flow control window, in bytes. Zero (with initial-window-size also zero) uses gRPC's dynamic BDP window sizing"`
 		WatchDelay                     time.Duration `long:"watch-delay" env:"WATCH_DELAY" default:"30ms" description:"Delay applied to the application of watched Etcd events. Larger values amortize the processing of fast-changing Etcd keys."`
 		AuthKeys                       string        `long:"auth-keys" env:"AUTH_KEYS" description:"Whitespace or comma separated, base64-encoded keys used to sign (first key) and verify (all keys) Authorization tokens." json:"-"`
 		AutoSuspend                    bool          `long:"auto-suspend" env:"AUTO_SUSPEND" description:"Automatically suspend journals which have persisted all fragments"`
+		BalancePrimaries               uint32        `long:"balance-primaries" env:"BALANCE_PRIMARIES" default:"0" description:"Maximum primary journal assignments handed off per allocation round, to balance primaries across brokers within a journal's app.gazette.dev/balance-group label. If zero, primary balancing is disabled"`
+		BalancePrimaryInterval         time.Duration `long:"balance-primary-interval" env:"BALANCE_PRIMARY_INTERVAL" default:"10s" description:"Minimum time between allocation rounds which hand off a primary journal assignment. With --balance-primaries this sets the handoff rate: that many per interval. Each handoff briefly interrupts one journal's appends while its replication pipeline is rebuilt, so an interval of a few seconds is enough to keep them from overlapping; raise --balance-primaries, not this, to correct a large imbalance sooner"`
 		DisableSignedUrls              bool          `long:"disable-signed-urls" env:"DISABLE_SIGNED_URLS" description:"When a signed URL is requested, return an unsigned URL instead. This is useful when clients do not require the signing."`
 		ForceStoreHealthCheckToHealthy bool          `long:"force-store-health-check-to-healthy" env:"FORCE_STORE_HEALTH_CHECK_TO_HEALTHY" description:"Force the health check of fragment stores to healthy"`
 	} `group:"Broker" namespace:"broker" env-namespace:"BROKER"`
@@ -103,6 +108,11 @@ func (cmdServe) Execute(args []string) error {
 		mbp.Must(err, "building peer TLS config")
 	}
 
+	// Must precede server.New, which builds the gRPC server and its loopback
+	// ClientConn with these windows already applied.
+	server.InitialWindowSize = Config.Broker.InitialWindowSize
+	server.InitialConnWindowSize = Config.Broker.InitialConnWindowSize
+
 	// Bind our server listener, grabbing a random available port if Port is zero.
 	srv, err := server.New("", Config.Broker.Host, Config.Broker.Port, serverTLS, peerTLS, Config.Broker.MaxGRPCRecvSize, nil)
 	mbp.Must(err, "building Server instance")
@@ -150,6 +160,7 @@ func (cmdServe) Execute(args []string) error {
 	broker.AutoSuspend = Config.Broker.AutoSuspend
 	broker.MaxAppendRate = int64(Config.Broker.MaxAppendRate)
 	broker.MinAppendRate = int64(Config.Broker.MinAppendRate)
+	broker.MinAppendRateGrace = Config.Broker.MinAppendRateGrace
 	pb.MaxReplication = int32(Config.Broker.MaxReplication)
 	stores.DisableSignedUrls = Config.Broker.DisableSignedUrls
 	stores.ForceStoreHealthCheckToHealthy = Config.Broker.ForceStoreHealthCheckToHealthy
@@ -187,12 +198,14 @@ func (cmdServe) Execute(args []string) error {
 	}).Info("starting broker")
 
 	mbp.Must(allocator.StartSession(allocator.SessionArgs{
-		Etcd:     etcd,
-		Tasks:    tasks,
-		Spec:     spec,
-		State:    allocState,
-		LeaseTTL: Config.Etcd.LeaseTTL,
-		SignalCh: signalCh,
+		Etcd:                    etcd,
+		Tasks:                   tasks,
+		Spec:                    spec,
+		State:                   allocState,
+		LeaseTTL:                Config.Etcd.LeaseTTL,
+		SignalCh:                signalCh,
+		MaxPrimarySwapsPerRound: int(Config.Broker.BalancePrimaries),
+		MinPrimarySwapInterval:  Config.Broker.BalancePrimaryInterval,
 	}), "failed to start allocator session")
 
 	var persister = fragment.NewPersister(ks)

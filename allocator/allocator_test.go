@@ -72,7 +72,7 @@ func (s *AllocatorSuite) TestConvergeFixtureCases(c *gc.C) {
 
 		{ItemID: "item-two", MemberZone: "us-east", MemberSuffix: "bar"},
 		{ItemID: "item-two", MemberZone: "us-west", MemberSuffix: "baz"},
-	})
+	}, false, nil)
 
 	var expectCmps = []clientv3.Cmp{
 		clientv3.Compare(clientv3.CreateRevision("/root/items/item-missing"), "=", 0),
@@ -95,7 +95,7 @@ func (s *AllocatorSuite) TestConvergeFixtureCases(c *gc.C) {
 
 		{ItemID: "item-two", MemberZone: "us-east", MemberSuffix: "foo"},
 		{ItemID: "item-two", MemberZone: "us-west", MemberSuffix: "baz"},
-	})
+	}, false, nil)
 
 	// In addition to the cleanup checks of the previous case,
 	// expect Member us-east/foo is also verified as unchanged.
