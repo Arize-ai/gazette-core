@@ -2,6 +2,7 @@ package allocator
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"testing"
 
@@ -955,6 +956,275 @@ func TestCleanupOfAssignmentsWithoutMember(t *testing.T) {
 		"/root/assign/item-1#zone-a#member-A#0",
 		"/root/assign/item-2#zone-a#member-A#0",
 	})
+}
+
+// TestPartitionedItemsBalanceAcrossMembers is a regression test ensuring
+// that Items sharing a common logical group (see itemGroup) -- such as the
+// partitions of a topic -- are evenly split across Members, rather than
+// clustering onto a subset of them as a result of incidental solver
+// dynamics (eg lexicographic ordering, or arc rotation).
+func TestPartitionedItemsBalanceAcrossMembers(t *testing.T) {
+	var ctx, client, ks = testSetup(t)
+
+	var kv []string
+	for i := 0; i != 16; i++ {
+		kv = append(kv, itemKey("a-topic/part-%02d", i), `{"R": 1}`)
+	}
+	for _, suffix := range []string{"A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8"} {
+		kv = append(kv, "/root/members/zone-a#member-"+suffix, `{"R": 100}`)
+	}
+	require.NoError(t, insert(ctx, client, kv...))
+	require.Equal(t, 2, serveUntilIdle(t, ctx, client, ks, ""))
+
+	require.Equal(t, map[string]int{
+		"member-A1": 2, "member-A2": 2, "member-A3": 2, "member-A4": 2,
+		"member-A5": 2, "member-A6": 2, "member-A7": 2, "member-A8": 2,
+	}, groupCountsByMember(ks, "a-topic"))
+}
+
+// TestPartitionedItemsBalanceWithReplication is a regression test for a bug
+// where the group fair-share cap counted each grouped Item once regardless
+// of its replication factor R. Within a single zone, every replica of every
+// Item must land in that zone, so the cap must scale by R -- otherwise it's
+// set far too low, is immediately relaxed under network pressure, and one
+// arbitrary Member ends up absorbing most of the group instead of the load
+// spreading evenly.
+func TestPartitionedItemsBalanceWithReplication(t *testing.T) {
+	var ctx, client, ks = testSetup(t)
+
+	var kv []string
+	for i := 0; i != 8; i++ {
+		kv = append(kv, itemKey("a-topic/part-%02d", i), `{"R": 2}`)
+	}
+	for _, suffix := range []string{"A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8"} {
+		kv = append(kv, "/root/members/zone-a#member-"+suffix, `{"R": 100}`)
+	}
+	require.NoError(t, insert(ctx, client, kv...))
+	serveUntilIdle(t, ctx, client, ks, "")
+
+	require.Equal(t, map[string]int{
+		"member-A1": 2, "member-A2": 2, "member-A3": 2, "member-A4": 2,
+		"member-A5": 2, "member-A6": 2, "member-A7": 2, "member-A8": 2,
+	}, groupCountsByMember(ks, "a-topic"))
+}
+
+// TestPrimaryBalanceIndependentOfReplicaMembership verifies that primary
+// (Slot 0) Assignments are rebalanced within a group even when replica
+// membership itself is already perfectly balanced and stable -- ie, the two
+// concerns are handled independently. It seeds a settled, balanced cluster,
+// then directly swaps Slot numbers (without altering which Members replicate
+// which Items) to artificially skew primaries onto a single Member, and
+// verifies the Allocator restores primary balance without perturbing
+// replica membership at all.
+func TestPrimaryBalanceIndependentOfReplicaMembership(t *testing.T) {
+	var ctx, client, ks = testSetup(t)
+
+	var kv []string
+	for i := 0; i != 8; i++ {
+		kv = append(kv, itemKey("a-topic/part-%02d", i), `{"R": 2}`)
+	}
+	for _, suffix := range []string{"A1", "A2", "A3", "A4"} {
+		kv = append(kv, "/root/members/zone-a#member-"+suffix, `{"R": 100}`)
+	}
+	require.NoError(t, insert(ctx, client, kv...))
+	serveUntilIdle(t, ctx, client, ks, "")
+
+	var baseline = groupCountsByMember(ks, "a-topic")
+	require.Equal(t, map[string]int{
+		"member-A1": 4, "member-A2": 4, "member-A3": 4, "member-A4": 4,
+	}, baseline)
+
+	// Group Assignments by Item, then force member-A1 to primary for every
+	// a-topic Item it currently replicates (swapping Slots with whichever
+	// Member is currently primary). This leaves each Item's 2-Member
+	// replica set completely untouched -- only which of the two is Slot 0.
+	var byItem = make(map[string]keyspace.KeyValues)
+	for _, kv := range ks.Prefixed(ks.Root + AssignmentsPrefix) {
+		var a = kv.Decoded.(Assignment)
+		if itemGroup(a.ItemID) == "a-topic" {
+			byItem[a.ItemID] = append(byItem[a.ItemID], kv)
+		}
+	}
+
+	var ops []clientv3.Op
+	for _, asn := range byItem {
+		var primary, other = asn[0], asn[1]
+		if primary.Decoded.(Assignment).Slot != 0 {
+			primary, other = other, primary
+		}
+		var pa, oa = primary.Decoded.(Assignment), other.Decoded.(Assignment)
+		if oa.MemberSuffix != "member-A1" {
+			continue // member-A1 doesn't replicate this Item, or is already primary.
+		}
+		pa.Slot, oa.Slot = 1, 0
+
+		ops = append(ops,
+			clientv3.OpDelete(string(primary.Raw.Key)),
+			clientv3.OpPut(AssignmentKey(ks, pa), string(primary.Raw.Value),
+				clientv3.WithLease(clientv3.LeaseID(primary.Raw.Lease))),
+			clientv3.OpDelete(string(other.Raw.Key)),
+			clientv3.OpPut(AssignmentKey(ks, oa), string(other.Raw.Value),
+				clientv3.WithLease(clientv3.LeaseID(other.Raw.Lease))),
+		)
+	}
+	require.NotEmpty(t, ops, "expected member-A1 to be a non-primary replica of at least one Item")
+
+	var _, err = client.Txn(ctx).Then(ops...).Commit()
+	require.NoError(t, err)
+
+	serveUntilIdle(t, ctx, client, ks, "")
+
+	// Replica membership is completely unaffected by primary rebalancing.
+	require.Equal(t, baseline, groupCountsByMember(ks, "a-topic"))
+
+	// But primary balance has been restored to a spread of at most one.
+	var primaries = primaryCountsByMember(ks, "a-topic")
+	require.Len(t, primaries, 4, "expected all four Members to hold at least one primary: %v", primaries)
+
+	var lo, hi = 1 << 30, 0
+	for _, n := range primaries {
+		lo, hi = min(lo, n), max(hi, n)
+	}
+	require.LessOrEqual(t, hi-lo, 1, "expected primaries to be rebalanced: %v", primaries)
+}
+
+// TestPartitionedItemsBalanceAcrossMembersWithUnrelatedLoad checks that
+// group balance holds even atop a cluster already carrying substantial,
+// unrelated (unevenly-distributed) load from other, singleton-group Items.
+func TestPartitionedItemsBalanceAcrossMembersWithUnrelatedLoad(t *testing.T) {
+	var ctx, client, ks = testSetup(t)
+
+	var kv []string
+	for _, suffix := range []string{"A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8"} {
+		kv = append(kv, "/root/members/zone-a#member-"+suffix, `{"R": 1000}`)
+	}
+	for i := 0; i != 300; i++ {
+		kv = append(kv, itemKey("noise-%04d", i), `{"R": 1}`)
+	}
+	require.NoError(t, insert(ctx, client, kv...))
+	serveUntilIdle(t, ctx, client, ks, "")
+
+	kv = kv[:0]
+	for i := 0; i != 16; i++ {
+		kv = append(kv, itemKey("a-topic/part-%02d", i), `{"R": 1}`)
+	}
+	require.NoError(t, insert(ctx, client, kv...))
+	serveUntilIdle(t, ctx, client, ks, "")
+
+	require.Equal(t, map[string]int{
+		"member-A1": 2, "member-A2": 2, "member-A3": 2, "member-A4": 2,
+		"member-A5": 2, "member-A6": 2, "member-A7": 2, "member-A8": 2,
+	}, groupCountsByMember(ks, "a-topic"))
+}
+
+// TestPartitionedItemsBalanceAcrossZonedMembers is a multi-zone variant,
+// checking that grouped Items replicated across zones balance evenly across
+// each zone's Members independently.
+func TestPartitionedItemsBalanceAcrossZonedMembers(t *testing.T) {
+	var ctx, client, ks = testSetup(t)
+
+	var kv []string
+	for i := 0; i != 16; i++ {
+		kv = append(kv, itemKey("a-topic/part-%02d", i), `{"R": 2}`)
+	}
+	for _, zone := range []string{"zone-a", "zone-b"} {
+		for _, suffix := range []string{"1", "2", "3", "4"} {
+			kv = append(kv, "/root/members/"+zone+"#member-"+suffix, `{"R": 100}`)
+		}
+	}
+	require.NoError(t, insert(ctx, client, kv...))
+	serveUntilIdle(t, ctx, client, ks, "")
+
+	var byZoneMember = make(map[string]int)
+	for _, kv := range ks.Prefixed(ks.Root + AssignmentsPrefix) {
+		var a = kv.Decoded.(Assignment)
+		if itemGroup(a.ItemID) == "a-topic" {
+			byZoneMember[a.MemberZone+"#"+a.MemberSuffix]++
+		}
+	}
+	require.Equal(t, map[string]int{
+		"zone-a#member-1": 4, "zone-a#member-2": 4, "zone-a#member-3": 4, "zone-a#member-4": 4,
+		"zone-b#member-1": 4, "zone-b#member-2": 4, "zone-b#member-3": 4, "zone-b#member-4": 4,
+	}, byZoneMember)
+}
+
+// TestPartitionedItemsBalanceUnderRollingMemberChurn is a regression test
+// for the scenario that originally motivated group-aware balancing: a
+// Kubernetes Deployment-style rolling restart, where Members are replaced
+// one at a time (each with an entirely new, randomly-suffixed identity),
+// repeated over many cycles. A purely soft/preferential balancing signal
+// degrades badly under this pattern, since each swap only reconsiders the
+// departing Member's own orphaned Items; only a hard per-group capacity
+// constraint (see buildGroupMemberArc) keeps groups tightly balanced
+// indefinitely.
+func TestPartitionedItemsBalanceUnderRollingMemberChurn(t *testing.T) {
+	var ctx, client, ks = testSetup(t)
+
+	var suffixes = []string{"gen0-1", "gen0-2", "gen0-3", "gen0-4", "gen0-5", "gen0-6", "gen0-7", "gen0-8"}
+
+	var kv []string
+	for _, suffix := range suffixes {
+		kv = append(kv, "/root/members/zone-a#member-"+suffix, `{"R": 1000}`)
+	}
+	for i := 0; i != 16; i++ {
+		kv = append(kv, itemKey("a-topic/part-%02d", i), `{"R": 1}`)
+	}
+	require.NoError(t, insert(ctx, client, kv...))
+	serveUntilIdle(t, ctx, client, ks, "")
+
+	// Replace each Member, one at a time, with a brand-new (differently
+	// suffixed) Member -- as a rolling Deployment update would -- and repeat
+	// for several generations.
+	for gen := 1; gen != 4; gen++ {
+		for i, old := range suffixes {
+			var next = fmt.Sprintf("gen%d-%d", gen, i+1)
+			require.NoError(t, insert(ctx, client, "/root/members/zone-a#member-"+next, `{"R": 1000}`))
+			serveUntilIdle(t, ctx, client, ks, "")
+
+			var _, err = client.Delete(ctx, "/root/members/zone-a#member-"+old)
+			require.NoError(t, err)
+			serveUntilIdle(t, ctx, client, ks, "")
+
+			suffixes[i] = next
+		}
+	}
+
+	var counts = groupCountsByMember(ks, "a-topic")
+	require.Len(t, counts, 8)
+	for member, n := range counts {
+		require.Equal(t, 2, n, "member %s should hold exactly 2 of a-topic's 16 Items", member)
+	}
+}
+
+// itemKey formats an Item key under /root/items/ from a printf-style pattern.
+func itemKey(format string, args ...interface{}) string {
+	return "/root/items/" + fmt.Sprintf(format, args...)
+}
+
+// groupCountsByMember returns, for the given logical group, the count of
+// current Assignments held by each Member suffix.
+func groupCountsByMember(ks *keyspace.KeySpace, group string) map[string]int {
+	var counts = make(map[string]int)
+	for _, kv := range ks.Prefixed(ks.Root + AssignmentsPrefix) {
+		var a = kv.Decoded.(Assignment)
+		if itemGroup(a.ItemID) == group {
+			counts[a.MemberSuffix]++
+		}
+	}
+	return counts
+}
+
+// primaryCountsByMember returns, for the given logical group, the count of
+// current primary (Slot == 0) Assignments held by each Member suffix.
+func primaryCountsByMember(ks *keyspace.KeySpace, group string) map[string]int {
+	var counts = make(map[string]int)
+	for _, kv := range ks.Prefixed(ks.Root + AssignmentsPrefix) {
+		var a = kv.Decoded.(Assignment)
+		if a.Slot == 0 && itemGroup(a.ItemID) == group {
+			counts[a.MemberSuffix]++
+		}
+	}
+	return counts
 }
 
 func testSetup(t *testing.T) (context.Context, *clientv3.Client, *keyspace.KeySpace) {

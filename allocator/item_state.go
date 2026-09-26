@@ -11,6 +11,13 @@ import (
 // desired changes to its Assignments.
 type itemState struct {
 	global *State
+	// desiredPrimary maps an Item ID, of a tracked multi-Item group (see
+	// itemGroup), to the Member ("zone#suffix") which a max-flow solve (see
+	// primaryFlowNetwork) has selected as its fair-share primary. It's
+	// computed once per converge() pass and consulted -- but never mutated
+	// -- by every itemState.init call of that pass. Items of an untracked
+	// (singleton) group have no entry.
+	desiredPrimary map[string]string
 
 	item    int                // Index of current Item within |global.Items|.
 	current keyspace.KeyValues // Sub-slice of Item's current Assignments within |global.Assignments|.
@@ -24,7 +31,8 @@ type itemState struct {
 // given |current| and |desired|.
 func (s *itemState) init(item int, current keyspace.KeyValues, desired []Assignment) {
 	*s = itemState{
-		global: s.global,
+		global:         s.global,
+		desiredPrimary: s.desiredPrimary,
 
 		item:    item,
 		current: current,
@@ -116,12 +124,49 @@ func (s *itemState) constrainReorders() {
 	sort.Slice(s.reorder, func(i, j int) bool {
 		return assignmentAt(s.reorder, i).Slot < assignmentAt(s.reorder, j).Slot
 	})
-	// The ordering is trivially satisfied iff there are no Assignments,
-	// and is otherwise satisfied iff there is a current primary.
-	if len(s.reorder) == 0 || assignmentAt(s.reorder, 0).Slot == 0 {
+	if len(s.reorder) == 0 {
 		return
 	}
 	var item = itemAt(s.global.Items, s.item)
+
+	// If a max-flow solve (see primaryFlowNetwork) computed a fair-share
+	// primary for this Item's group, and that Member is among our staying
+	// replicas, it takes precedence -- even over an existing primary --
+	// since it reflects a considered, group-wide balancing decision rather
+	// than a merely local one.
+	if want, ok := s.desiredPrimary[item.ID]; ok {
+		for i := range s.reorder {
+			if memberKeyOf(assignmentAt(s.reorder, i)) != want {
+				continue
+			}
+			if !s.global.IsConsistent(item, s.reorder[i], s.current) {
+				break // Not yet synchronized: fall through to default handling.
+			}
+			if i != 0 {
+				// If we're displacing an existing primary (as opposed to
+				// simply filling a vacancy), debit its MemberPrimaryCount
+				// here: buildPackOps (which will shift it down to a
+				// non-zero Slot) has no notion of primaries. The new
+				// primary is credited by buildPromoteOps, exactly as it
+				// already is when filling a vacancy.
+				if cur := assignmentAt(s.reorder, 0); cur.Slot == 0 {
+					if ind, found := s.global.Members.Search(MemberKey(s.global.KS, cur.MemberZone, cur.MemberSuffix)); found {
+						s.global.MemberPrimaryCount[ind]--
+					}
+				}
+				var kv = s.reorder[i]
+				copy(s.reorder[1:i+1], s.reorder[:i])
+				s.reorder[0] = kv
+			}
+			return
+		}
+		// The desired primary isn't among our staying replicas (eg it was
+		// just removed this round). Fall through to the default behavior.
+	}
+
+	if assignmentAt(s.reorder, 0).Slot == 0 {
+		return // Already has a primary, and no group guidance says otherwise.
+	}
 
 	// There is no current primary. Select an assignment to promote, preferring:
 	// a) Assignments which are currently consistent, and then
@@ -150,6 +195,11 @@ func (s *itemState) constrainReorders() {
 	// Shift elements [0, primary.index) to the right, by one.
 	copy(s.reorder[1:primary.index+1], s.reorder[:primary.index])
 	s.reorder[0] = primary.kv
+}
+
+// memberKeyOf returns a "zone#suffix" key identifying an Assignment's Member.
+func memberKeyOf(a Assignment) string {
+	return a.MemberZone + "#" + a.MemberSuffix
 }
 
 // constrainAdds prunes Assignments from |s.add| which would otherwise violate constraints.

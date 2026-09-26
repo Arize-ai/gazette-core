@@ -38,6 +38,8 @@ type appendFSM struct {
 	clientSummer        hash.Hash               // Summer over the client's content.
 	clientTotalChunks   int64                   // Total number of append chunks.
 	clientDelayedChunks int64                   // Number of flow-controlled chunks.
+	clientFlowStats     appendFlowStats         // Flow control accounting, for diagnostics.
+	clientFlowPoliced   bool                    // Did this broker police the client's flow rate?
 	state               appendState             // Current FSM state.
 	err                 error                   // Error encountered during FSM execution.
 }
@@ -82,6 +84,7 @@ func (b *appendFSM) run(recv func() (*pb.AppendRequest, error)) {
 	// Note that we can't access |fc| after calling onReadAcknowledgements.
 	b.clientTotalChunks = fc.totalChunks
 	b.clientDelayedChunks = fc.delayedChunks
+	b.clientFlowStats, b.clientFlowPoliced = fc.stats(), true
 
 	b.onReadAcknowledgements()
 }
