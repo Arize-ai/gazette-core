@@ -94,6 +94,23 @@ func (it *ReadUncommittedIter) Next() (Envelope, error) {
 			continue
 
 		default:
+			// RetryReader surfaces a write head regression as a typed error
+			// rather than a sentinel, so it must be matched with errors.As and
+			// cannot be a case of this switch (which compares by equality).
+			var offsetErr *client.OffsetExceedsWriteHeadError
+			if errors.As(err, &offsetErr) {
+				// The read offset is ahead of the journal's write head, indicating
+				// the write head moved backward (e.g., after reset-head). Return
+				// the error unwrapped so the consumer can persist an adjusted
+				// checkpoint before restarting, avoiding a stale offset on future
+				// recovery.
+				log.WithFields(log.Fields{
+					"journal":    it.spec.Name,
+					"readOffset": begin,
+					"writeHead":  offsetErr.WriteHead,
+				}).Error("read offset exceeds journal write head (possible reset-head)")
+				return Envelope{}, err
+			}
 			return Envelope{}, errors.WithMessagef(err, "framing.Unmarshal(offset %d)", begin)
 		}
 	}

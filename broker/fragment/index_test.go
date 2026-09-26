@@ -97,6 +97,118 @@ func TestQueryAtHead(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestQueryOffsetExceedsZeroWriteHead(t *testing.T) {
+	setWriteHeadRegressionGrace(t, time.Millisecond)
+
+	var ind = NewIndex(context.Background())
+
+	// Complete a first remote refresh with no fragments: the write head is zero
+	// (e.g. a journal whose fragments were all lost and then reset).
+	ind.ReplaceRemote(CoverSet{})
+
+	// A blocking read ahead of the (zero) write head must not block waiting for
+	// misaligned appends; it returns OFFSET_NOT_YET_AVAILABLE with WriteHead 0 so
+	// the client can restart at the write head.
+	var resp, file, err = ind.Query(context.Background(), &pb.ReadRequest{Offset: 100, Block: true})
+	require.Equal(t, &pb.ReadResponse{
+		Status:    pb.Status_OFFSET_NOT_YET_AVAILABLE,
+		Offset:    100,
+		WriteHead: 0,
+	}, resp)
+	require.Nil(t, file)
+	require.NoError(t, err)
+}
+
+func TestQueryAheadOfUnrefreshedIndexBlocks(t *testing.T) {
+	setWriteHeadRegressionGrace(t, time.Millisecond)
+
+	var ind = NewIndex(context.Background())
+
+	// Local content exists, but a first remote refresh has NOT completed, so the
+	// index may still lag the journal's true persisted extent. A read ahead of
+	// the current EndOffset() must block rather than falsely report a regressed
+	// write head.
+	ind.SpoolCommit(buildSet(t, 0, 50)[0])
+
+	var ch = make(chan *pb.ReadResponse, 1)
+	go func() {
+		var resp, _, _ = ind.Query(context.Background(), &pb.ReadRequest{Offset: 100, Block: true})
+		ch <- resp
+	}()
+
+	select {
+	case <-ch:
+		t.Fatal("Query returned before the first remote refresh")
+	case <-time.After(50 * time.Millisecond):
+		// Still blocked, as expected.
+	}
+
+	// Completing the first refresh allows the detector to fire.
+	ind.ReplaceRemote(buildSet(t, 0, 50))
+
+	require.Equal(t, &pb.ReadResponse{
+		Status:    pb.Status_OFFSET_NOT_YET_AVAILABLE,
+		Offset:    100,
+		WriteHead: 50,
+	}, <-ch)
+}
+
+func TestQueryOffsetExceedsWriteHeadAfterGracePeriod(t *testing.T) {
+	setWriteHeadRegressionGrace(t, time.Millisecond)
+
+	var ind = NewIndex(context.Background())
+
+	// Post `gazctl journals reset-head`: the write head is the max indexed
+	// fragment offset (50), while a stale consumer still reads at offset 100.
+	ind.ReplaceRemote(buildSet(t, 0, 50))
+
+	// The read is not served misaligned data, and is not blocked until appends
+	// grow past it. The client is told the current write head instead.
+	var resp, file, err = ind.Query(context.Background(), &pb.ReadRequest{Offset: 100, Block: true})
+	require.Equal(t, &pb.ReadResponse{
+		Status:    pb.Status_OFFSET_NOT_YET_AVAILABLE,
+		Offset:    100,
+		WriteHead: 50,
+	}, resp)
+	require.Nil(t, file)
+	require.NoError(t, err)
+}
+
+func TestQueryAheadOfWriteHeadAwaitsGracePeriod(t *testing.T) {
+	setWriteHeadRegressionGrace(t, time.Hour) // Effectively never elapses.
+
+	var ind = NewIndex(context.Background())
+
+	// A first remote refresh has completed, but this broker is newly assigned to
+	// the journal and isn't yet aware of the Fragment covering offset 100: it's
+	// still being uploaded, or is held in a peer's Spool. A read ahead of the
+	// write head must keep blocking through this hand-off race, rather than
+	// reporting a regression which would rewind the consumer.
+	ind.ReplaceRemote(buildSet(t, 0, 50))
+
+	var ch = make(chan *pb.ReadResponse, 1)
+	go func() {
+		var resp, _, _ = ind.Query(context.Background(), &pb.ReadRequest{Offset: 100, Block: true})
+		ch <- resp
+	}()
+
+	select {
+	case resp := <-ch:
+		t.Fatalf("Query reported a regression within the grace period: %v", resp)
+	case <-time.After(50 * time.Millisecond):
+		// Still blocked, as expected.
+	}
+
+	// The Fragment arrives: the read is served, and no regression is reported.
+	ind.SpoolCommit(buildSet(t, 50, 150)[0])
+
+	require.Equal(t, &pb.ReadResponse{
+		Offset:    100,
+		WriteHead: 150,
+		Fragment:  &pb.Fragment{Begin: 50, End: 150},
+	}, <-ch)
+}
+
 func TestQueryAtMissingByteZero(t *testing.T) {
 	var ind = NewIndex(context.Background())
 	var now = time.Now().Unix()
@@ -348,6 +460,14 @@ func TestInspectCases(t *testing.T) {
 		require.Equal(t, set, s)
 		return nil
 	}))
+}
+
+// setWriteHeadRegressionGrace overrides the write head regression grace period
+// for the duration of a test.
+func setWriteHeadRegressionGrace(t *testing.T, d time.Duration) {
+	var restore = writeHeadRegressionGrace
+	writeHeadRegressionGrace = d
+	t.Cleanup(func() { writeHeadRegressionGrace = restore })
 }
 
 func buildSet(t *testing.T, offsets ...int64) CoverSet {

@@ -39,6 +39,23 @@ During journal replication:
 3. **Commit/Rollback**: Transactional operations extend or revert fragment content
 4. **Completion**: Finished spools queued for background persistence
 
+### Write Head Regression
+
+`Index.Query` ordinarily *blocks* a read of an offset ahead of the index. That covers
+the race between delayed persistence to a fragment store and hand-off of a journal to
+a new broker, where the broker serving the read isn't yet aware of a fragment which is
+being uploaded or is held in a peer's spool.
+
+A write head which moved *backward*, as `gazctl journals reset-head` does, is
+indistinguishable from that race at first glance — but blocking is wrong, because new
+appends will never align with the message framing at the requested offset, and the
+reader would eventually be served mid-message data.
+
+`Query` separates the two by requiring that the condition persist for
+`writeHeadRegressionGrace` after the index's first remote refresh. It then returns
+`OFFSET_NOT_YET_AVAILABLE` carrying the current write head, which `broker/client`
+surfaces as an `OffsetExceedsWriteHeadError` so the reader can restart there.
+
 ### Persistence
 
 The `Persister` manages asynchronous fragment persistence:

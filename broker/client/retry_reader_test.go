@@ -119,6 +119,33 @@ func (s *RetrySuite) TestMisbehavingReaderCases(c *gc.C) {
 	}
 }
 
+func (s *RetrySuite) TestOffsetExceedsZeroWriteHead(c *gc.C) {
+	var broker = teststub.NewBroker(c)
+	defer broker.Cleanup()
+
+	var rjc = pb.NewRoutedJournalClient(broker.Client(), pb.NoopDispatchRouter{})
+
+	// A blocking read at offset 100 against a journal whose write head is zero
+	// (e.g. a reset journal whose fragments were all lost).
+	var rr = NewRetryReader(context.Background(), rjc,
+		pb.ReadRequest{Journal: "a/journal", Offset: 100, Block: true})
+
+	var zero = int64(0)
+	go serveReadFixtures(c, broker,
+		readFixture{status: pb.Status_OFFSET_NOT_YET_AVAILABLE, writeHead: &zero},
+	)
+
+	// Expect the read offset exceeding even a zero write head is surfaced
+	// (rather than retried endlessly) so the consumer can restart at the head.
+	var _, err = rr.Read(make([]byte, 16))
+
+	var offsetErr *OffsetExceedsWriteHeadError
+	c.Check(errors.As(err, &offsetErr), gc.Equals, true)
+	c.Check(offsetErr.Journal, gc.Equals, pb.Journal("a/journal"))
+	c.Check(offsetErr.WriteHead, gc.Equals, int64(0))
+	c.Check(errors.Is(err, ErrOffsetExceedsWriteHead), gc.Equals, true)
+}
+
 func (s *RetrySuite) TestSeeking(c *gc.C) {
 	var frag, url, dir, cleanup = buildFragmentFixture(c)
 	defer cleanup()

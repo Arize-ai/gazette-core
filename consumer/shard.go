@@ -2,11 +2,14 @@ package consumer
 
 import (
 	"context"
+	stderrors "errors"
 	"runtime/pprof"
 	"sync"
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	log "github.com/sirupsen/logrus"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.gazette.dev/core/allocator"
@@ -36,6 +39,11 @@ const (
 	// before the message sequencer will prune the older producer state.
 	messageSequencerPruneHorizon = time.Hour * 24
 )
+
+var writeHeadResets = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "gazette_writehead_resets_total",
+	Help: "Times a consumer source offset was rewound to the journal write head after a detected write head regression",
+}, []string{"journal"})
 
 type shard struct {
 	svc          *Service                  // Service which owns the shard.
@@ -269,10 +277,18 @@ func servePrimary(s *shard) (err error) {
 		}
 		var msgCh = make(chan EnvelopeOrError, chanSize)
 
+		// Readers started by this iteration are scoped to |readCtx|. If we
+		// restart the loop below, cancelling it tears down those readers and
+		// their Read RPCs, rather than leaving them parked on the abandoned
+		// |msgCh| until the shard itself is cancelled. MessageProducer
+		// applications start and own their own readers, so they keep s.ctx.
+		var readCtx, readCancel = context.WithCancel(s.ctx)
+		defer readCancel()
+
 		if mp, ok := s.svc.App.(MessageProducer); ok {
 			mp.StartReadingMessages(s, s.store, cp, msgCh)
 		} else {
-			startReadingMessages(s, cp, msgCh)
+			startReadingMessages(readCtx, s, cp, msgCh)
 		}
 
 		var ringSize = s.Spec().RingBufferSize
@@ -286,6 +302,14 @@ func servePrimary(s *shard) (err error) {
 		)
 
 		if err = runTransactions(s, cp, msgCh, hintsCh); err != nil {
+			var offsetErr *client.OffsetExceedsWriteHeadError
+			if stderrors.As(err, &offsetErr) {
+				if cp, err = recoverWriteHeadRegression(s, offsetErr); err != nil {
+					return err
+				}
+				readCancel() // Tear down this iteration's readers before restarting.
+				continue     // Restart the transaction loop with corrected checkpoint.
+			}
 			return errors.WithMessage(err, "runTransactions")
 		}
 
@@ -293,11 +317,54 @@ func servePrimary(s *shard) (err error) {
 		// This may be the same Checkpoint we last committed, but it may not be:
 		// that's up to the application.
 
+		readCancel() // Tear down this iteration's readers before restarting.
+
 		cp, err = s.store.RestoreCheckpoint(s)
 		if err != nil {
 			return errors.WithMessage(err, "restart store.RestoreCheckpoint")
 		}
 	}
+}
+
+// recoverWriteHeadRegression handles a source journal whose write head moved
+// backward (eg, after `gazctl journals reset-head`), which leaves the shard
+// checkpointed at an offset that no longer aligns with message framing.
+//
+// It restores the last committed checkpoint, rewinds the affected journal's
+// ReadThrough to the journal's current write head, and durably commits the
+// result before returning it. Committing here is what distinguishes this from a
+// plain restart: the adjusted offset survives a subsequent crash, so a later
+// recovery cannot resurrect the stale offset once appends have grown past it.
+func recoverWriteHeadRegression(s *shard, offsetErr *client.OffsetExceedsWriteHeadError) (pc.Checkpoint, error) {
+	var cp, err = s.store.RestoreCheckpoint(s)
+	if err != nil {
+		return cp, errors.WithMessage(err, "RestoreCheckpoint after write head regression")
+	}
+
+	// Set (rather than only update) the source, so that a journal absent from
+	// the checkpoint is still bounded and cannot regress on every restart.
+	if cp.Sources == nil {
+		cp.Sources = make(map[pb.Journal]pc.Checkpoint_Source)
+	}
+	var src = cp.Sources[offsetErr.Journal]
+	src.ReadThrough = offsetErr.WriteHead
+	cp.Sources[offsetErr.Journal] = src
+
+	var barrier = s.store.StartCommit(s, cp, nil)
+	<-barrier.Done()
+
+	if err = barrier.Err(); err != nil {
+		return cp, errors.WithMessage(err, "committing adjusted checkpoint after write head regression")
+	}
+	writeHeadResets.WithLabelValues(offsetErr.Journal.String()).Inc()
+
+	log.WithFields(log.Fields{
+		"shard":     s.Spec().Id,
+		"journal":   offsetErr.Journal,
+		"writeHead": offsetErr.WriteHead,
+	}).Warn("persisted adjusted checkpoint after journal write head regression")
+
+	return cp, nil
 }
 
 // waitAndTearDown waits for all outstanding goroutines which are accessing
@@ -370,7 +437,7 @@ type EnvelopeOrError struct {
 }
 
 // startReadingMessages from source journals into the provided channel.
-func startReadingMessages(s *shard, cp pc.Checkpoint, ch chan<- EnvelopeOrError) {
+func startReadingMessages(ctx context.Context, s *shard, cp pc.Checkpoint, ch chan<- EnvelopeOrError) {
 	for _, src := range s.Spec().Sources {
 
 		// Lower-bound checkpoint offset to the ShardSpec.Source.MinOffset.
@@ -381,7 +448,7 @@ func startReadingMessages(s *shard, cp pc.Checkpoint, ch chan<- EnvelopeOrError)
 		}
 
 		var it = message.NewReadUncommittedIter(
-			client.NewRetryReader(s.ctx, s.ajc, pb.ReadRequest{
+			client.NewRetryReader(ctx, s.ajc, pb.ReadRequest{
 				Journal:    src.Journal,
 				Offset:     offset,
 				Block:      true,
@@ -403,7 +470,7 @@ func startReadingMessages(s *shard, cp pc.Checkpoint, ch chan<- EnvelopeOrError)
 				default:
 					select {
 					case ch <- v:
-					case <-s.ctx.Done():
+					case <-ctx.Done():
 						return
 					}
 				}
