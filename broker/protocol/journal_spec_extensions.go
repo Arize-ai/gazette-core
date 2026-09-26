@@ -315,6 +315,12 @@ func (m *JournalSpec) DesiredReplication() int {
 	return int(r)
 }
 
+// BalanceGroup returns the labels.BalanceGroup of the spec, or "" if it has
+// none. It implements allocator.ItemGroupValue.
+func (m *JournalSpec) BalanceGroup() string {
+	return m.LabelSet.ValueOf(labels.BalanceGroup)
+}
+
 // UnionJournalSpecs returns a JournalSpec combining all non-zero-valued fields
 // across |a| and |b|. Where both |a| and |b| provide a non-zero value for
 // a field, the value of |a| is retained.
