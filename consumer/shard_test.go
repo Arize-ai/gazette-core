@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	"go.gazette.dev/core/broker/client"
 	pb "go.gazette.dev/core/broker/protocol"
 	pc "go.gazette.dev/core/consumer/protocol"
 	"go.gazette.dev/core/labels"
@@ -69,59 +68,6 @@ func TestReadMessagesStopWithReaderContext(t *testing.T) {
 		require.ErrorIs(t, (<-ch).Error, context.Canceled)
 	}
 	require.NoError(t, shard.ctx.Err())
-}
-
-func TestRecoverWriteHeadRegression(t *testing.T) {
-	var _, shard, cleanup = newTestFixtureWithIdleShard(t)
-	defer cleanup()
-
-	_ = playAndComplete(t, shard)
-
-	// Commit a checkpoint which reads both sources through non-zero offsets.
-	var barrier = shard.store.StartCommit(shard, pc.Checkpoint{
-		Sources: map[pb.Journal]pc.Checkpoint_Source{
-			sourceA.Name: {ReadThrough: 9000},
-			sourceB.Name: {ReadThrough: 7000},
-		},
-	}, nil)
-	<-barrier.Done()
-	require.NoError(t, barrier.Err())
-
-	// sourceA's write head regressed behind our checkpoint, as it does after
-	// `gazctl journals reset-head`.
-	var cp, err = recoverWriteHeadRegression(shard, &client.OffsetExceedsWriteHeadError{
-		Journal:   sourceA.Name,
-		WriteHead: 1234,
-	})
-	require.NoError(t, err)
-
-	// sourceA is rewound to the write head, and sourceB is carried through.
-	require.Equal(t, int64(1234), cp.Sources[sourceA.Name].ReadThrough)
-	require.Equal(t, int64(7000), cp.Sources[sourceB.Name].ReadThrough)
-
-	// Crucially, the rewind is *durable*: a subsequent recovery cannot resurrect
-	// the stale offset once appends have grown past it again.
-	var restored pc.Checkpoint
-	restored, err = shard.store.RestoreCheckpoint(shard)
-	require.NoError(t, err)
-	require.Equal(t, cp, restored)
-}
-
-func TestRecoverWriteHeadRegressionOfUncheckpointedJournal(t *testing.T) {
-	var _, shard, cleanup = newTestFixtureWithIdleShard(t)
-	defer cleanup()
-
-	_ = playAndComplete(t, shard)
-
-	// A journal absent from the checkpoint must still be bounded to the write
-	// head. Otherwise the read would regress again on every restart, spinning
-	// the transaction loop.
-	var cp, err = recoverWriteHeadRegression(shard, &client.OffsetExceedsWriteHeadError{
-		Journal:   sourceB.Name,
-		WriteHead: 42,
-	})
-	require.NoError(t, err)
-	require.Equal(t, int64(42), cp.Sources[sourceB.Name].ReadThrough)
 }
 
 func TestReadMessagesFailsWithUnknownJournal(t *testing.T) {

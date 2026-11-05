@@ -25,9 +25,11 @@ const (
 // Such a read is ambiguous. It's either a genuine regression, or it's the
 // hand-off race described in Query below, where a newly-assigned broker isn't
 // yet aware of a Fragment which is being uploaded or which is held in a peer's
-// Spool. The race resolves within a journal pulse (see pulseDaemon), whereas a
-// regression is permanent and admin-initiated, so waiting distinguishes the two
-// at the cost of a bounded delay on the rare regression path.
+// Spool. The race resolves within a journal pulse (see pulseDaemon): the pulse
+// synchronizes the replication pipeline, which rolls this broker's Spool forward
+// to its peers' End and reports it via SpoolRolled, even if no content is
+// appended. A regression is permanent and admin-initiated, so waiting
+// distinguishes the two at the cost of a bounded delay on the rare regression path.
 var writeHeadRegressionGrace = 5 * time.Second
 
 // Index maintains a queryable index of local and remote journal Fragments.
@@ -37,6 +39,7 @@ type Index struct {
 	local          CoverSet        // Local Fragments only (having non-nil File).
 	condCh         chan struct{}   // Condition variable; notifies blocked queries on each |set| update.
 	firstRefreshCh chan struct{}   // Closed when the first remote index load has completed.
+	spoolEnd       int64           // End of the most-recently rolled Spool. See SpoolRolled.
 	mu             sync.RWMutex    // Guards |set| and |condCh|.
 }
 
@@ -151,21 +154,21 @@ func (fi *Index) Query(ctx context.Context, req *pb.ReadRequest) (*pb.ReadRespon
 		// We gate on the first remote refresh (rather than EndOffset() > 0) so
 		// the case is also detected when the write head is zero, e.g. after a
 		// reset of a journal whose fragments were all lost. After the first
-		// refresh EndOffset() reflects the journal's true extent, so a zero
-		// EndOffset() genuinely means the head is at zero.
+		// refresh writeHead() reflects at least the journal's persisted extent,
+		// so a zero writeHead() genuinely means the head is at zero.
 		//
 		// We further require that the condition persist for
 		// writeHeadRegressionGrace. Otherwise we would break the hand-off race
 		// described above: a broker which is newly assigned to this journal, and
 		// hasn't yet learned of a Fragment being uploaded or held in a peer's
 		// Spool, must keep blocking rather than report a spurious regression.
-		if refreshed && resp.Offset > fi.set.EndOffset() {
+		if writeHead := fi.writeHead(); refreshed && resp.Offset > writeHead {
 			if graceExpired {
 				resp.Status = pb.Status_OFFSET_NOT_YET_AVAILABLE
-				resp.WriteHead = fi.set.EndOffset()
+				resp.WriteHead = writeHead
 
 				addTrace(ctx, "Index.Query(%s) => %s (read offset %d exceeds write head %d)",
-					req, resp, resp.Offset, fi.set.EndOffset())
+					req, resp, resp.Offset, writeHead)
 				return resp, nil, nil
 			}
 			if graceTimer == nil {
@@ -173,7 +176,7 @@ func (fi *Index) Query(ctx context.Context, req *pb.ReadRequest) (*pb.ReadRespon
 				graceCh = graceTimer.C
 
 				addTrace(ctx, "Index.Query(%s) => read offset %d exceeds write head %d; awaiting grace period",
-					req, resp.Offset, fi.set.EndOffset())
+					req, resp.Offset, writeHead)
 			}
 		} else if graceTimer != nil {
 			// The index caught up: this was the hand-off race and not a
@@ -227,6 +230,25 @@ func (fi *Index) SpoolCommit(frag Fragment) {
 	fi.set, _ = fi.set.Add(frag)
 	fi.local, _ = fi.local.Add(frag)
 	fi.wakeBlockedQueries()
+}
+
+// SpoolRolled records the End of a Spool which rolled to a new, empty Fragment.
+// CoverSet ignores empty Fragments, so without this a replica whose Spool was
+// rolled forward by pipeline synchronization -- but which hasn't yet seen
+// content beyond its persisted Fragments -- would under-report its write head.
+func (fi *Index) SpoolRolled(frag Fragment) {
+	defer fi.mu.Unlock()
+	fi.mu.Lock()
+
+	fi.spoolEnd = frag.End
+	fi.wakeBlockedQueries()
+}
+
+// writeHead is the best known write head of the journal: the greater of
+// indexed Fragment content and the most-recently rolled Spool.
+// fi.mu must already be held.
+func (fi *Index) writeHead() int64 {
+	return max(fi.set.EndOffset(), fi.spoolEnd)
 }
 
 // ReplaceRemote replaces all remote Fragments in the index with |set|.

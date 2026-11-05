@@ -52,9 +52,15 @@ appends will never align with the message framing at the requested offset, and t
 reader would eventually be served mid-message data.
 
 `Query` separates the two by requiring that the condition persist for
-`writeHeadRegressionGrace` after the index's first remote refresh. It then returns
+`writeHeadRegressionGrace` after the index's first remote refresh. The write head it
+compares against is the greater of indexed content and the End of the most recently
+rolled spool (`SpoolRolled`): a journal pulse synchronizes the pipeline and rolls a newly
+assigned replica's spool forward to its peers' End even when no content is appended, so
+an idle journal's hand-off resolves within the grace period. `Query` then returns
 `OFFSET_NOT_YET_AVAILABLE` carrying the current write head, which `broker/client`
-surfaces as an `OffsetExceedsWriteHeadError` so the reader can restart there.
+surfaces (for opted-in, blocking readers) as an `OffsetExceedsWriteHeadError`.
+The consumer commits a checkpoint rewound to that head within its normal
+transaction (see `consumer/transaction.go`), then restarts reads.
 
 ### Persistence
 

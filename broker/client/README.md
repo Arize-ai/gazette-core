@@ -13,8 +13,10 @@ The module is organized around four main concerns:
 ### Reading
 - **Reader**: Basic `io.Reader` adapter for single Read RPCs
 - **RetryReader**: Resilient reader that automatically restarts Read RPCs on failure
-  - Exception: it returns `OffsetExceedsWriteHeadError` rather than retrying when the
-    read offset is ahead of the journal's write head, meaning the head moved backward.
+  - Opt-in exception: with `SurfaceWriteHeadRegression` set, it returns
+    `OffsetExceedsWriteHeadError` rather than retrying when a *blocking* read is ahead of
+    the journal's write head, meaning the head moved backward. The consumer transaction
+    loop opts in; other readers (eg, recovery-log playback) keep retrying.
     See "Write Head Regression" in `broker/fragment`.
 
 ### Writing  

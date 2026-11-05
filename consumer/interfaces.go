@@ -330,6 +330,10 @@ var (
 		Name: "gazette_shard_phase_seconds_total",
 		Help: "Cumulative number of seconds processing transactions.",
 	}, []string{"shard", "phase", "type"})
+	shardWriteHeadResetsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "gazette_shard_write_head_resets_total",
+		Help: "Times a shard's source offset was rewound to the journal write head after a detected write head regression.",
+	}, []string{"shard", "journal"})
 
 	// DEPRECATED metrics to be removed:
 	txCountTotal = promauto.NewCounter(prometheus.CounterOpts{

@@ -747,6 +747,117 @@ func TestRunTxnsAppErrorCases(t *testing.T) {
 	}
 }
 
+func TestRunTxnsCommitsRewindOfRegressedJournal(t *testing.T) {
+	var tf, shard, cleanup = newTestFixtureWithIdleShard(t)
+	defer cleanup()
+
+	var (
+		cp       = playAndComplete(t, shard)
+		msgCh    = make(chan EnvelopeOrError, 2)
+		altMsgCh = make(chan EnvelopeOrError, 3)
+		store    = shard.store.(*JSONFileStore)
+	)
+	startReadingMessages(shard.ctx, shard, cp, msgCh)
+
+	// Messages of both sources are read into a transaction, and then sourceA
+	// reports that its write head regressed. The transaction is mid-flight:
+	// its effects are applied to the store but not yet committed.
+	_, _ = tf.pub.PublishCommitted(toSourceA, &testMessage{Key: "a", Value: "1"})
+	_, _ = tf.pub.PublishCommitted(toSourceB, &testMessage{Key: "b", Value: "2"})
+	altMsgCh <- <-msgCh
+	altMsgCh <- <-msgCh
+	altMsgCh <- EnvelopeOrError{Error: &client.OffsetExceedsWriteHeadError{
+		Journal:   sourceA.Name,
+		WriteHead: 1,
+	}}
+
+	var err = runTransactions(shard, cp, altMsgCh, nil)
+	var offsetErr *client.OffsetExceedsWriteHeadError
+	require.True(t, errors.As(err, &offsetErr))
+	require.Equal(t, sourceA.Name, offsetErr.Journal)
+
+	// The transaction committed normally, rather than being abandoned or having
+	// its partial effects committed out-of-band with a stale checkpoint:
+	// effects and published messages are applied and ACK'd exactly once,
+	// sourceA is rewound to its write head, and sourceB is read through.
+	verifyStoreAndEchoOut(t, shard, map[string]string{"a": "1", "b": "2"})
+	require.Equal(t, int64(1), store.checkpoint.Sources[sourceA.Name].ReadThrough)
+	require.NotZero(t, store.checkpoint.Sources[sourceB.Name].ReadThrough)
+	require.NotEmpty(t, store.checkpoint.AckIntents[echoOut.Name])
+
+	// The rewind is durable: a later recovery cannot resurrect the stale
+	// offset once appends have grown past it again.
+	var restored, restoreErr = store.RestoreCheckpoint(shard)
+	require.NoError(t, restoreErr)
+	require.Equal(t, store.checkpoint, restored)
+}
+
+func TestRunTxnsCommitsRewindWhenIdle(t *testing.T) {
+	var tf, shard, cleanup = newTestFixtureWithIdleShard(t)
+	defer cleanup()
+
+	var (
+		cp    = playAndComplete(t, shard)
+		msgCh = make(chan EnvelopeOrError, 1)
+		store = shard.store.(*JSONFileStore)
+	)
+	// The common case: the shard is idle at the tip of a journal which is
+	// absent from its checkpoint, when the regression is reported. An empty
+	// transaction commits the rewind, without calling into the application.
+	tf.app.finalizeErr = errors.New("FinalizeTxn must not be called")
+
+	msgCh <- EnvelopeOrError{Error: &client.OffsetExceedsWriteHeadError{
+		Journal:   sourceB.Name,
+		WriteHead: 42,
+	}}
+	var err = runTransactions(shard, cp, msgCh, nil)
+	require.True(t, errors.Is(err, client.ErrOffsetExceedsWriteHead))
+
+	verifyStoreAndEchoOut(t, shard, map[string]string{})
+	require.Equal(t, int64(42), store.checkpoint.Sources[sourceB.Name].ReadThrough)
+}
+
+func TestRewindCheckpointSource(t *testing.T) {
+	var producer = func(id byte, begin int64) pc.Checkpoint_Source_ProducerEntry {
+		return pc.Checkpoint_Source_ProducerEntry{
+			Id:    []byte{id},
+			State: pc.Checkpoint_ProducerState{LastAck: 1, Begin: begin},
+		}
+	}
+	var cp = pc.Checkpoint{
+		Sources: map[pb.Journal]pc.Checkpoint_Source{
+			"a/journal": {
+				ReadThrough: 500,
+				Producers: []pc.Checkpoint_Source_ProducerEntry{
+					producer(1, -1),  // No pending transaction.
+					producer(2, 100), // Pending transaction began before the write head.
+					producer(3, 200), // Began exactly at the write head.
+					producer(4, 300), // Began within lost content.
+				},
+			},
+			"b/journal": {ReadThrough: 700},
+		},
+	}
+	rewindCheckpointSource(&cp, "a/journal", 200)
+	rewindCheckpointSource(&cp, "c/journal", 42) // Absent from the checkpoint.
+
+	require.Equal(t, pc.Checkpoint{
+		Sources: map[pb.Journal]pc.Checkpoint_Source{
+			"a/journal": {
+				ReadThrough: 200,
+				Producers: []pc.Checkpoint_Source_ProducerEntry{
+					producer(1, -1),
+					producer(2, 100),
+					producer(3, -1),
+					producer(4, -1),
+				},
+			},
+			"b/journal": {ReadThrough: 700},
+			"c/journal": {ReadThrough: 42},
+		},
+	}, cp)
+}
+
 func mustTxnStep(t require.TestingT, s *shard, txn, prior *transaction) bool {
 	var done, err = txnStep(s, txn, prior)
 	require.NoError(t, err)

@@ -209,6 +209,53 @@ func TestQueryAheadOfWriteHeadAwaitsGracePeriod(t *testing.T) {
 	}, <-ch)
 }
 
+func TestQueryAheadOfIndexButAtRolledSpoolBlocks(t *testing.T) {
+	setWriteHeadRegressionGrace(t, 10*time.Millisecond)
+
+	var ind = NewIndex(context.Background())
+
+	// A newly-assigned replica of an idle journal: it knows only persisted
+	// Fragments through 50, while the true write head is 100 (held in a peer's
+	// Spool and not yet persisted). A pulse synchronizes the pipeline, which
+	// rolls our Spool forward to an empty Fragment at 100. No content commits,
+	// so the CoverSet's EndOffset() stays at 50.
+	ind.ReplaceRemote(buildSet(t, 0, 50))
+	ind.SpoolRolled(Fragment{Fragment: pb.Fragment{Begin: 100, End: 100}})
+
+	var ch = make(chan *pb.ReadResponse, 1)
+	go func() {
+		var resp, _, _ = ind.Query(context.Background(), &pb.ReadRequest{Offset: 100, Block: true})
+		ch <- resp
+	}()
+
+	// A read at the rolled head is a read at the tip, and must not be reported
+	// as a regression even after the grace period elapses.
+	select {
+	case resp := <-ch:
+		t.Fatalf("Query reported a regression at the rolled Spool head: %v", resp)
+	case <-time.After(50 * time.Millisecond):
+		// Still blocked, as expected.
+	}
+
+	// A later append is served normally.
+	ind.SpoolCommit(buildSet(t, 100, 150)[0])
+
+	require.Equal(t, &pb.ReadResponse{
+		Offset:    100,
+		WriteHead: 150,
+		Fragment:  &pb.Fragment{Begin: 100, End: 150},
+	}, <-ch)
+
+	// A read beyond the rolled head is still detected as a regression.
+	var resp, _, err = ind.Query(context.Background(), &pb.ReadRequest{Offset: 200, Block: true})
+	require.NoError(t, err)
+	require.Equal(t, &pb.ReadResponse{
+		Status:    pb.Status_OFFSET_NOT_YET_AVAILABLE,
+		Offset:    200,
+		WriteHead: 150,
+	}, resp)
+}
+
 func TestQueryAtMissingByteZero(t *testing.T) {
 	var ind = NewIndex(context.Background())
 	var now = time.Now().Unix()

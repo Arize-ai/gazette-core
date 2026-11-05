@@ -129,6 +129,7 @@ func (s *RetrySuite) TestOffsetExceedsZeroWriteHead(c *gc.C) {
 	// (e.g. a reset journal whose fragments were all lost).
 	var rr = NewRetryReader(context.Background(), rjc,
 		pb.ReadRequest{Journal: "a/journal", Offset: 100, Block: true})
+	rr.SurfaceWriteHeadRegression = true
 
 	var zero = int64(0)
 	go serveReadFixtures(c, broker,
@@ -144,6 +145,41 @@ func (s *RetrySuite) TestOffsetExceedsZeroWriteHead(c *gc.C) {
 	c.Check(offsetErr.Journal, gc.Equals, pb.Journal("a/journal"))
 	c.Check(offsetErr.WriteHead, gc.Equals, int64(0))
 	c.Check(errors.Is(err, ErrOffsetExceedsWriteHead), gc.Equals, true)
+}
+
+func (s *RetrySuite) TestOffsetExceedsWriteHeadIsOptIn(c *gc.C) {
+	var broker = teststub.NewBroker(c)
+	defer broker.Cleanup()
+
+	var rjc = pb.NewRoutedJournalClient(broker.Client(), pb.NoopDispatchRouter{})
+	var head = int64(50)
+
+	// Without opting in, a blocking read ahead of the write head is retried
+	// (as before), and is served once content arrives at its offset.
+	var rr = NewRetryReader(context.Background(), rjc,
+		pb.ReadRequest{Journal: "a/journal", Offset: 100, Block: true})
+
+	go serveReadFixtures(c, broker,
+		readFixture{status: pb.Status_OFFSET_NOT_YET_AVAILABLE, writeHead: &head},
+		readFixture{content: "hello"},
+	)
+	var buf = make([]byte, 5)
+	var _, err = io.ReadFull(rr, buf)
+	c.Check(err, gc.IsNil)
+	c.Check(string(buf), gc.Equals, "hello")
+
+	// Having opted in, a non-blocking read ahead of the write head still
+	// returns ErrOffsetNotYetAvailable. The broker applies no grace period to
+	// non-blocking reads, so a lagging write head isn't evidence of regression.
+	rr = NewRetryReader(context.Background(), rjc,
+		pb.ReadRequest{Journal: "a/journal", Offset: 100, Block: false})
+	rr.SurfaceWriteHeadRegression = true
+
+	go serveReadFixtures(c, broker,
+		readFixture{status: pb.Status_OFFSET_NOT_YET_AVAILABLE, writeHead: &head},
+	)
+	_, err = rr.Read(buf)
+	c.Check(err, gc.Equals, ErrOffsetNotYetAvailable)
 }
 
 func (s *RetrySuite) TestSeeking(c *gc.C) {
