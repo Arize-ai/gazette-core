@@ -2,6 +2,7 @@ package consumer
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"runtime/trace"
@@ -19,6 +20,12 @@ import (
 // |readCh| and, when notified by |hintsCh|, occasionally stores recorded FSMHints.
 // If |readCh| closes, runTransactions completes and fully commits a current
 // transaction and then returns.
+//
+// If a source journal's write head regressed behind its read offset,
+// runTransactions completes and fully commits a current transaction (which may
+// be empty) having a checkpoint rewound to the write head, and then returns the
+// *client.OffsetExceedsWriteHeadError. The caller must restart reads from the
+// committed checkpoint.
 func runTransactions(s *shard, cp pc.Checkpoint, readCh <-chan EnvelopeOrError, hintsCh <-chan time.Time) error {
 	var (
 		realTimer = time.NewTimer(0)
@@ -82,6 +89,8 @@ func runTransactions(s *shard, cp pc.Checkpoint, readCh <-chan EnvelopeOrError, 
 		txnInit(s, &txn, &prev, readCh, txnTimer)
 		if err := txnRun(s, &txn, &prev); err != nil {
 			return err
+		} else if txn.regression != nil {
+			return txnAwaitRegression(s, &txn)
 		} else if txn.consumedCount == 0 {
 			return nil // |readCh| has closed and drained.
 		}
@@ -91,15 +100,16 @@ func runTransactions(s *shard, cp pc.Checkpoint, readCh <-chan EnvelopeOrError, 
 
 // transaction models a single consumer shard transaction.
 type transaction struct {
-	minDur, maxDur time.Duration          // Min/max processing durations. Set to -1 when elapsed.
-	waitForAck     bool                   // Wait for ACKs of pending messages read this txn?
-	barrierCh      <-chan struct{}        // Next barrier of previous transaction to resolve.
-	readCh         <-chan EnvelopeOrError // Message source. Nil'd upon reaching |maxDur|.
-	consumedCount  int                    // Number of acknowledged Messages consumed.
-	consumedBytes  int64                  // Number of acknowledged Message bytes consumed.
-	checkpoint     pc.Checkpoint          // Checkpoint upon the commit of this transaction.
-	commitBarrier  OpFuture               // Barrier at which this transaction commits.
-	acks           OpFutures              // ACKs of published messages, queued on |commitBarrier|.
+	minDur, maxDur time.Duration                       // Min/max processing durations. Set to -1 when elapsed.
+	waitForAck     bool                                // Wait for ACKs of pending messages read this txn?
+	barrierCh      <-chan struct{}                     // Next barrier of previous transaction to resolve.
+	readCh         <-chan EnvelopeOrError              // Message source. Nil'd upon reaching |maxDur|.
+	consumedCount  int                                 // Number of acknowledged Messages consumed.
+	consumedBytes  int64                               // Number of acknowledged Message bytes consumed.
+	checkpoint     pc.Checkpoint                       // Checkpoint upon the commit of this transaction.
+	commitBarrier  OpFuture                            // Barrier at which this transaction commits.
+	acks           OpFutures                           // ACKs of published messages, queued on |commitBarrier|.
+	regression     *client.OffsetExceedsWriteHeadError // Write head regression read this txn, if any.
 
 	timer             txnTimer
 	prevPrepareDoneAt time.Time // Time at which previous transaction finished preparing.
@@ -205,7 +215,7 @@ func txnStep(s *shard, txn, prev *transaction) (bool, error) {
 		}
 	}
 
-	if txn.consumedCount == 0 {
+	if txn.consumedCount == 0 && txn.regression == nil {
 		return true, nil // |readCh| has closed and drained.
 	} else if cp, err := txnStartCommit(s, txn); err != nil {
 		return false, fmt.Errorf("txnStartCommit: %w", err)
@@ -214,15 +224,26 @@ func txnStep(s *shard, txn, prev *transaction) (bool, error) {
 	}
 
 	// If the timer is still running, stop and drain it.
-	if txn.maxDur != -1 && !txn.timer.Stop() {
+	// It's never started if the transaction is empty.
+	if txn.consumedCount != 0 && txn.maxDur != -1 && !txn.timer.Stop() {
 		<-txn.timer.C
 	}
 	return true, nil
 }
 
 func txnRead(s *shard, txn, prev *transaction, env EnvelopeOrError, ok bool) error {
+	var offsetErr *client.OffsetExceedsWriteHeadError
+
 	if !ok {
 		txn.readCh = nil // Channel is closed, don't select it again.
+		return nil
+	} else if errors.As(env.Error, &offsetErr) {
+		// Rather than fail mid-transaction, which would leave the store holding
+		// uncommitted effects of messages already consumed, stop reading and
+		// let the transaction commit normally. txnStartCommit rewinds the
+		// journal within that commit, after which reads restart.
+		txn.regression = offsetErr
+		txn.readCh = nil
 		return nil
 	} else if env.Error != nil {
 		return fmt.Errorf("readMessage: %w", env.Error)
@@ -438,10 +459,15 @@ func txnStartCommit(s *shard, txn *transaction) (pc.Checkpoint, error) {
 		txn.stalledAt = txn.prepareBeganAt // We spent no time stalled.
 	}
 
-	trace.Log(s.ctx, "App.FinalizeTxn", s.resolved.fqn)
-	var err = s.svc.App.FinalizeTxn(s, s.store, s.publisher)
-	if err != nil {
-		return pc.Checkpoint{}, fmt.Errorf("app.FinalizeTxn: %w", err)
+	var err error
+
+	// An empty transaction commits only to rewind a regressed journal.
+	// The application didn't begin it, and has nothing to finalize.
+	if txn.consumedCount != 0 {
+		trace.Log(s.ctx, "App.FinalizeTxn", s.resolved.fqn)
+		if err = s.svc.App.FinalizeTxn(s, s.store, s.publisher); err != nil {
+			return pc.Checkpoint{}, fmt.Errorf("app.FinalizeTxn: %w", err)
+		}
 	}
 
 	var offsets, states = s.sequencer.Checkpoint(messageSequencerPruneHorizon)
@@ -450,6 +476,10 @@ func txnStartCommit(s *shard, txn *transaction) (pc.Checkpoint, error) {
 		return pc.Checkpoint{}, fmt.Errorf("publisher.BuildAckIntents: %w", err)
 	}
 	txn.checkpoint = pc.BuildCheckpoint(bca)
+
+	if txn.regression != nil {
+		rewindCheckpointSource(&txn.checkpoint, txn.regression.Journal, txn.regression.WriteHead)
+	}
 
 	// Collect pending journal writes before we start to commit. We'll require
 	// that the Store wait on all |waitFor| operations before it commits, to
@@ -477,6 +507,57 @@ func txnStartCommit(s *shard, txn *transaction) (pc.Checkpoint, error) {
 	txn.prepareDoneAt = txn.timer.Now()
 
 	return txn.checkpoint, nil
+}
+
+// rewindCheckpointSource rewinds |journal| of |cp| to |writeHead|, after the
+// journal's write head regressed behind the checkpoint (eg, after
+// `gazctl journals reset-head`). Content beyond |writeHead| was lost and will be
+// re-written with different framing, so any producer transaction which began
+// within it is discarded: replaying it upon a later ACK would read misaligned
+// content. The source is set even if absent, so that the journal is bounded on
+// every restart.
+func rewindCheckpointSource(cp *pc.Checkpoint, journal pb.Journal, writeHead int64) {
+	if cp.Sources == nil {
+		cp.Sources = make(map[pb.Journal]pc.Checkpoint_Source)
+	}
+	var src = cp.Sources[journal]
+
+	if _, ok := cp.Sources[journal]; !ok || src.ReadThrough > writeHead {
+		src.ReadThrough = writeHead
+	}
+	for i := range src.Producers {
+		if src.Producers[i].State.Begin >= writeHead {
+			src.Producers[i].State.Begin = -1
+		}
+	}
+	cp.Sources[journal] = src
+}
+
+// txnAwaitRegression waits for the commit and ACKs of |txn|, which rewound a
+// journal having a regressed write head, and then returns its regression error
+// to signal that reads must restart from the committed checkpoint.
+func txnAwaitRegression(s *shard, txn *transaction) error {
+	if <-txn.commitBarrier.Done(); txn.commitBarrier.Err() != nil {
+		return fmt.Errorf("store.StartCommit: %w", txn.commitBarrier.Err())
+	}
+	txn.committedAt = txn.timer.Now()
+
+	for ack := range txn.acks {
+		if <-ack.Done(); ack.Err() != nil {
+			return fmt.Errorf("ack: %w", ack.Err())
+		}
+	}
+	txn.ackedAt = txn.timer.Now()
+
+	if txn.consumedCount != 0 {
+		recordMetrics(s, txn)
+	}
+	signalProgress(s, func(readThrough, _ pb.Offsets) {
+		for journal, source := range txn.checkpoint.Sources {
+			readThrough[journal] = source.ReadThrough
+		}
+	})
+	return txn.regression
 }
 
 func txnAcknowledge(s *shard, txn *transaction, cp pc.Checkpoint) error {

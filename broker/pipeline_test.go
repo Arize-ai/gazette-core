@@ -325,6 +325,7 @@ type testSpoolObserver struct {
 }
 
 func (o *testSpoolObserver) SpoolCommit(f fragment.Fragment) { o.commits = append(o.commits, f) }
+func (o *testSpoolObserver) SpoolRolled(fragment.Fragment)   {}
 func (o *testSpoolObserver) SpoolComplete(s fragment.Spool, _ bool) {
 	o.completes = append(o.completes, s)
 }

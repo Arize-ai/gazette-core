@@ -118,6 +118,30 @@ func TestCompressionNotPrimary(t *testing.T) {
 		contentString(t, obv.completes[0], pb.CompressionCodec_GZIP))
 }
 
+func TestSpoolRollForwardIsObserved(t *testing.T) {
+	var obv testSpoolObserver
+	var spool = NewSpool("a/journal", &obv)
+
+	// A newly-added replica receives a proposal of a peer's non-empty Fragment
+	// which ends beyond anything it knows. It rolls forward to an empty Fragment
+	// at the proposal's End, and reports a mismatch so that the primary rolls too.
+	var resp, err = spool.Apply(newProposal(pb.Fragment{
+		Journal:          "a/journal",
+		Begin:            50,
+		End:              100,
+		CompressionCodec: pb.CompressionCodec_NONE,
+	}, regEmpty), false)
+	require.NoError(t, err)
+	require.Equal(t, pb.Status_PROPOSAL_MISMATCH, resp.Status)
+
+	// The roll is observed though no content was committed, which is how the
+	// Index learns the journal's write head from pipeline synchronization.
+	require.Empty(t, obv.commits)
+	require.Len(t, obv.rolls, 1)
+	require.Equal(t, int64(100), obv.rolls[0].Begin)
+	require.Equal(t, int64(100), obv.rolls[0].End)
+}
+
 func TestGzipBatcherMultipleMembers(t *testing.T) {
 	var origBatchSize = compressionBatchSize
 	compressionBatchSize = 10
@@ -684,10 +708,12 @@ func runReplicateSequence(t *testing.T, s *Spool, codec pb.CompressionCodec, pri
 
 type testSpoolObserver struct {
 	commits   []Fragment
+	rolls     []Fragment
 	completes []Spool
 }
 
 func (o *testSpoolObserver) SpoolCommit(f Fragment)        { o.commits = append(o.commits, f) }
+func (o *testSpoolObserver) SpoolRolled(f Fragment)        { o.rolls = append(o.rolls, f) }
 func (o *testSpoolObserver) SpoolComplete(s Spool, _ bool) { o.completes = append(o.completes, s) }
 
 // newProposal is a convenience which returns a ReplicateRequest with

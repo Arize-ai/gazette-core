@@ -52,6 +52,11 @@ type Spool struct {
 type SpoolObserver interface {
 	// SpoolCommit is called when the Spool Fragment is extended.
 	SpoolCommit(Fragment)
+	// SpoolRolled is called when the Spool rolls to a new and empty Fragment.
+	// Its End is the journal's write head as agreed by the replication
+	// pipeline, which may exceed any Fragment content this replica has seen
+	// (eg, a replica newly added to a route rolls forward to its peers' End).
+	SpoolRolled(Fragment)
 	// SpoolComplete is called when the Spool has been completed.
 	SpoolComplete(_ Spool, primary bool)
 }
@@ -151,6 +156,7 @@ func (s *Spool) applyCommit(r *pb.ReplicateRequest, primary bool) pb.ReplicateRe
 			sumState:  zeroedSHA1State,
 			observer:  s.observer,
 		}
+		s.observer.SpoolRolled(s.Fragment)
 	}
 
 	// There are now two proposal cases which can succeed:

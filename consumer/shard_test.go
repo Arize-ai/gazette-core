@@ -33,7 +33,7 @@ func TestReadMessages(t *testing.T) {
 	shard.Spec().Sources[0].MinOffset = aa.Response().Commit.End
 
 	var ch = make(chan EnvelopeOrError, 12)
-	startReadingMessages(shard, cp, ch)
+	startReadingMessages(shard.ctx, shard, cp, ch)
 
 	_, _ = tf.pub.PublishCommitted(toSourceA, &testMessage{Key: "one"})
 	require.Equal(t, "one", (<-ch).Envelope.Message.(*testMessage).Key)
@@ -44,6 +44,32 @@ func TestReadMessages(t *testing.T) {
 	require.Regexp(t, `framing.Unmarshal\(offset \d+\): context canceled`, (<-ch).Error)
 }
 
+func TestReadMessagesStopWithReaderContext(t *testing.T) {
+	var tf, shard, cleanup = newTestFixtureWithIdleShard(t)
+	defer cleanup()
+
+	// Readers of a transaction loop iteration are scoped to a context derived
+	// from the shard, so that restarting the loop (as happens on a write head
+	// regression) tears them down rather than leaving them parked on the
+	// abandoned channel while holding open their Read RPCs.
+	var readCtx, readCancel = context.WithCancel(shard.ctx)
+
+	var ch = make(chan EnvelopeOrError, 12)
+	startReadingMessages(readCtx, shard, pc.Checkpoint{}, ch)
+
+	var aa, _ = tf.pub.PublishCommitted(toSourceA, &testMessage{Key: "one"})
+	<-aa.Done()
+	require.Equal(t, "one", (<-ch).Envelope.Message.(*testMessage).Key)
+
+	readCancel()
+
+	// Every reader terminates, though the shard's own context is still live.
+	for range shard.Spec().Sources {
+		require.ErrorIs(t, (<-ch).Error, context.Canceled)
+	}
+	require.NoError(t, shard.ctx.Err())
+}
+
 func TestReadMessagesFailsWithUnknownJournal(t *testing.T) {
 	var _, shard, cleanup = newTestFixtureWithIdleShard(t)
 	defer cleanup()
@@ -52,7 +78,7 @@ func TestReadMessagesFailsWithUnknownJournal(t *testing.T) {
 	shard.resolved.spec.Sources[1].Journal = "yyy/zzz"
 
 	// Error is detected on first attempt at reading a message.
-	startReadingMessages(shard, pc.Checkpoint{}, ch)
+	startReadingMessages(shard.ctx, shard, pc.Checkpoint{}, ch)
 	require.EqualError(t, (<-ch).Error,
 		"fetching journal spec: named journal does not exist (yyy/zzz)")
 }
@@ -65,7 +91,7 @@ func TestReadMessagesFailsWithBadFraming(t *testing.T) {
 	shard.resolved.spec.Sources[1].Journal = shard.Spec().RecoveryLog()
 
 	// Error is detected on first attempt at reading a message.
-	startReadingMessages(shard, pc.Checkpoint{}, ch)
+	startReadingMessages(shard.ctx, shard, pc.Checkpoint{}, ch)
 	require.EqualError(t, (<-ch).Error, "determining framing: unrecognized "+labels.ContentType+
 		" ("+labels.ContentType_RecoveryLog+")")
 }

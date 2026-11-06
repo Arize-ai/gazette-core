@@ -362,6 +362,7 @@ type readFixture struct {
 	offset      int64
 	fragment    *pb.Fragment
 	fragmentUrl string
+	writeHead   *int64 // Overrides the default WriteHead when non-nil.
 }
 
 func (f readFixture) serve(c *gc.C, broker *teststub.Broker) {
@@ -383,7 +384,12 @@ func (f readFixture) serve(c *gc.C, broker *teststub.Broker) {
 	}
 
 	if f.status != pb.Status_OK && len(f.content) == 0 {
+		// A status-only response (e.g. OFFSET_NOT_YET_AVAILABLE) carries no
+		// Fragment, matching what the broker actually returns. This also lets
+		// such responses validate with a WriteHead below the default template
+		// Fragment.End.
 		resp.Status = f.status
+		resp.Fragment = nil
 	}
 	if f.offset != 0 {
 		resp.Offset = f.offset
@@ -394,6 +400,9 @@ func (f readFixture) serve(c *gc.C, broker *teststub.Broker) {
 	if f.fragmentUrl != "" {
 		resp.FragmentUrl = f.fragmentUrl
 	}
+	if f.writeHead != nil {
+		resp.WriteHead = *f.writeHead
+	}
 
 	broker.ReadRespCh <- resp
 
@@ -402,7 +411,10 @@ func (f readFixture) serve(c *gc.C, broker *teststub.Broker) {
 		broker.ReadRespCh <- pb.ReadResponse{Offset: resp.Offset + int64(l/2), Content: []byte(f.content[l/2:])}
 
 		if f.status != pb.Status_OK {
-			broker.ReadRespCh <- pb.ReadResponse{Status: f.status}
+			// Carry the WriteHead, as the broker does on a real status response.
+			// A zero WriteHead here would otherwise read as an offset-exceeds-
+			// write-head condition once the read offset has advanced past it.
+			broker.ReadRespCh <- pb.ReadResponse{Status: f.status, WriteHead: resp.WriteHead}
 		}
 	}
 	broker.WriteLoopErrCh <- f.err

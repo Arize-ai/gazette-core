@@ -29,6 +29,12 @@ type RetryReader struct {
 	// ongoing blocked Read (as well as any future Reads) to return a "Cancelled"
 	// error. Restart may be called to re-initialize the RetryReader.
 	Cancel context.CancelFunc
+	// SurfaceWriteHeadRegression opts into returning *OffsetExceedsWriteHeadError
+	// when a blocking read is ahead of the journal's write head, rather than
+	// retrying. It's opt-in because the caller must be prepared to durably
+	// rewind its offset, as the consumer transaction loop does. Other readers
+	// (eg, recovery-log playback) retain the retrying behavior.
+	SurfaceWriteHeadRegression bool
 }
 
 // NewRetryReader returns a RetryReader initialized with the BrokerClient and ReadRequest.
@@ -56,6 +62,8 @@ func (rr *RetryReader) Offset() int64 {
 //   - Cancel is called, or the RetryReader context is cancelled.
 //   - The broker returns OFFSET_NOT_YET_AVAILABLE (ErrOffsetNotYetAvailable)
 //     for a non-blocking ReadRequest.
+//   - SurfaceWriteHeadRegression is set, and the broker reports that a blocking
+//     read is ahead of the journal write head (*OffsetExceedsWriteHeadError).
 //   - An offset jump occurred (ErrOffsetJump), in which case the client
 //     should inspect the new Offset and may continue reading if desired.
 //   - The broker returns io.EOF upon reaching the requested EndOffset.
@@ -94,6 +102,24 @@ func (rr *RetryReader) Read(p []byte) (n int, err error) {
 		case context.DeadlineExceeded, context.Canceled:
 			return // Surface to caller.
 		case ErrOffsetNotYetAvailable:
+			if rr.SurfaceWriteHeadRegression && rr.Reader.Request.Block &&
+				rr.Reader.Request.Offset > rr.Reader.Response.WriteHead {
+				// A blocking read is ahead of the journal's write head. The
+				// broker reports this only after a grace period which rules out
+				// hand-off races, so it indicates the write head moved backward
+				// (e.g., after reset-head). Non-blocking reads are excluded: the
+				// broker applies no such grace to them, and they may see a
+				// lagging write head from a newly-assigned broker.
+				//
+				// We do not require WriteHead > 0 so that a reset to a zero
+				// write head (a journal whose fragments were all lost) is also
+				// surfaced rather than retried endlessly.
+				err = &OffsetExceedsWriteHeadError{
+					Journal:   rr.Reader.Request.Journal,
+					WriteHead: rr.Reader.Response.WriteHead,
+				}
+				return
+			}
 			if rr.Reader.Request.Block {
 				// |Block| was set after a non-blocking reader was started. Restart in blocking mode.
 				squelch = true
@@ -180,6 +206,9 @@ func (rr *RetryReader) Seek(offset int64, whence int) (int64, error) {
 
 // AdjustedOffset delegates to the current Reader's AdjustedOffset.
 func (rr *RetryReader) AdjustedOffset(br *bufio.Reader) int64 { return rr.Reader.AdjustedOffset(br) }
+
+// WriteHead returns the write head from the most recent ReadResponse.
+func (rr *RetryReader) WriteHead() int64 { return rr.Reader.Response.WriteHead }
 
 // AdjustedSeek sets the offset for the next Read, accounting for buffered data and,
 // where possible, accomplishing the AdjustedSeek by discarding from the bufio.Reader.

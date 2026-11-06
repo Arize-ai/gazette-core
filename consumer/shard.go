@@ -2,6 +2,7 @@ package consumer
 
 import (
 	"context"
+	stderrors "errors"
 	"runtime/pprof"
 	"sync"
 	"time"
@@ -269,10 +270,18 @@ func servePrimary(s *shard) (err error) {
 		}
 		var msgCh = make(chan EnvelopeOrError, chanSize)
 
-		if mp, ok := s.svc.App.(MessageProducer); ok {
+		// Readers started by this iteration are scoped to |readCtx|. If we
+		// restart the loop below, cancelling it tears down those readers and
+		// their Read RPCs, rather than leaving them parked on the abandoned
+		// |msgCh| until the shard itself is cancelled. MessageProducer
+		// applications start and own their own readers, so they keep s.ctx.
+		var readCtx, readCancel = context.WithCancel(s.ctx)
+		var mp, isProducer = s.svc.App.(MessageProducer)
+
+		if isProducer {
 			mp.StartReadingMessages(s, s.store, cp, msgCh)
 		} else {
-			startReadingMessages(s, cp, msgCh)
+			startReadingMessages(readCtx, s, cp, msgCh)
 		}
 
 		var ringSize = s.Spec().RingBufferSize
@@ -285,7 +294,23 @@ func servePrimary(s *shard) (err error) {
 			int(ringSize),
 		)
 
-		if err = runTransactions(s, cp, msgCh, hintsCh); err != nil {
+		err = runTransactions(s, cp, msgCh, hintsCh)
+		readCancel() // Tear down this iteration's readers.
+
+		var offsetErr *client.OffsetExceedsWriteHeadError
+		if stderrors.As(err, &offsetErr) && !isProducer {
+			// runTransactions has committed a checkpoint which rewinds the
+			// journal to its write head. Restart reads from that checkpoint.
+			// MessageProducer applications own their readers, which we cannot
+			// restart, so for them this remains a terminal error.
+			shardWriteHeadResetsTotal.WithLabelValues(s.FQN(), offsetErr.Journal.String()).Inc()
+
+			log.WithFields(log.Fields{
+				"shard":     s.FQN(),
+				"journal":   offsetErr.Journal,
+				"writeHead": offsetErr.WriteHead,
+			}).Warn("rewound shard checkpoint after journal write head regression")
+		} else if err != nil {
 			return errors.WithMessage(err, "runTransactions")
 		}
 
@@ -370,7 +395,7 @@ type EnvelopeOrError struct {
 }
 
 // startReadingMessages from source journals into the provided channel.
-func startReadingMessages(s *shard, cp pc.Checkpoint, ch chan<- EnvelopeOrError) {
+func startReadingMessages(ctx context.Context, s *shard, cp pc.Checkpoint, ch chan<- EnvelopeOrError) {
 	for _, src := range s.Spec().Sources {
 
 		// Lower-bound checkpoint offset to the ShardSpec.Source.MinOffset.
@@ -380,13 +405,16 @@ func startReadingMessages(s *shard, cp pc.Checkpoint, ch chan<- EnvelopeOrError)
 			offset = src.MinOffset
 		}
 
-		var it = message.NewReadUncommittedIter(
-			client.NewRetryReader(s.ctx, s.ajc, pb.ReadRequest{
-				Journal:    src.Journal,
-				Offset:     offset,
-				Block:      true,
-				DoNotProxy: !s.ajc.IsNoopRouter(),
-			}), s.svc.App.NewMessage)
+		var rr = client.NewRetryReader(ctx, s.ajc, pb.ReadRequest{
+			Journal:    src.Journal,
+			Offset:     offset,
+			Block:      true,
+			DoNotProxy: !s.ajc.IsNoopRouter(),
+		})
+		// runTransactions durably rewinds a source whose write head regressed.
+		rr.SurfaceWriteHeadRegression = true
+
+		var it = message.NewReadUncommittedIter(rr, s.svc.App.NewMessage)
 
 		s.wg.Add(1)
 		go func(it message.Iterator) {
@@ -403,7 +431,7 @@ func startReadingMessages(s *shard, cp pc.Checkpoint, ch chan<- EnvelopeOrError)
 				default:
 					select {
 					case ch <- v:
-					case <-s.ctx.Done():
+					case <-ctx.Done():
 						return
 					}
 				}
