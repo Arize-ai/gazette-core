@@ -119,3 +119,4 @@ When planning, examine READMEs for crucial context.
 - Use `logrus` package
 - Structured logging with key-value pairs
 - Avoid verbose logging in hot paths
+
