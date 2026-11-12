@@ -16,6 +16,39 @@ import (
 	"google.golang.org/grpc/backoff"
 )
 
+// HTTP/2 flow control windows used by every client connection. A single
+// Gazette broker frequently serves LOTS of Journals. Readers will start many
+// concurrent reads of various journals, but may process them in arbitrary
+// orders, which means a journal stream could be "readable" and have available
+// stream-level flow control, but still not send data because the
+// connection-level flow control window is filled. So, effectively disable
+// connection-level flow control and use only stream-level flow control.
+//
+// These are static, and deliberately not derived from
+// server.InitialConnWindowSize: those vars are assigned by `gazette serve`
+// alone, so a gazctl or consumer process would always read them as zero and
+// silently get no windows at all -- which is worse than either setting, because
+// gRPC's dynamic sizing gives the connection the same window as a single
+// stream, and many journals multiplexed onto one connection then block on each
+// other's undrained bytes.
+//
+// Note gRPC couples the two options: configuring either one disables dynamic
+// (BDP) sizing for both. The stream window is therefore stated explicitly
+// rather than left to gRPC's 64KB fallback.
+const (
+	clientInitialConnWindowSize = math.MaxInt32
+	clientInitialWindowSize     = 1 << 16
+)
+
+// clientFlowControlOptions used by MustDial. Unconditional by design: see
+// clientInitialConnWindowSize.
+func clientFlowControlOptions() []grpc.DialOption {
+	return []grpc.DialOption{
+		grpc.WithInitialConnWindowSize(clientInitialConnWindowSize),
+		grpc.WithInitialWindowSize(clientInitialWindowSize),
+	}
+}
+
 // AddressConfig of a remote service.
 type AddressConfig struct {
 	Address       pb.Endpoint `long:"address" env:"ADDRESS" default:"http://localhost:8080" description:"Service address endpoint"`
@@ -37,21 +70,15 @@ func (c *AddressConfig) MustDial(ctx context.Context) *grpc.ClientConn {
 
 	cc, err := grpc.DialContext(ctx,
 		c.Address.GRPCAddr(),
-		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(1024*1024*16)),
-		grpc.WithTransportCredentials(pb.NewDispatchedCredentials(tlsConfig, c.Address)),
-		grpc.WithConnectParams(grpc.ConnectParams{Backoff: backoffConfig}),
-		// A single Gazette broker frequently serves LOTS of Journals.
-		// Readers will start many concurrent reads of various journals,
-		// but may process them in arbitrary orders, which means a journal
-		// stream could be "readable" and have available stream-level flow control,
-		// but still not send data because the connection-level flow control window
-		// is filled. So, effectively disable connection-level flow control and use
-		// only stream-level flow control.
-		grpc.WithInitialConnWindowSize(math.MaxInt32),
-		grpc.WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingConfig": [{"%s":{}}]}`, pb.DispatcherGRPCBalancerName)),
-		// Instrument client for gRPC metric collection.
-		grpc.WithUnaryInterceptor(grpc_prometheus.UnaryClientInterceptor),
-		grpc.WithStreamInterceptor(grpc_prometheus.StreamClientInterceptor),
+		append(clientFlowControlOptions(),
+			grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(1024*1024*16)),
+			grpc.WithTransportCredentials(pb.NewDispatchedCredentials(tlsConfig, c.Address)),
+			grpc.WithConnectParams(grpc.ConnectParams{Backoff: backoffConfig}),
+			grpc.WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingConfig": [{"%s":{}}]}`, pb.DispatcherGRPCBalancerName)),
+			// Instrument client for gRPC metric collection.
+			grpc.WithUnaryInterceptor(grpc_prometheus.UnaryClientInterceptor),
+			grpc.WithStreamInterceptor(grpc_prometheus.StreamClientInterceptor),
+		)...,
 	)
 	Must(err, "failed to dial remote service", "endpoint", c.Address)
 

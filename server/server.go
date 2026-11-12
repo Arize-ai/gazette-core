@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -21,6 +22,86 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
 )
+
+// HTTP/2 flow control windows advertised by the Server and by its connections
+// to peers. If both are zero -- the default -- no window options are configured
+// and gRPC applies dynamic (BDP-estimated) sizing, growing windows with the
+// measured bandwidth-delay product.
+//
+// These govern the broker's own server and its peer connections only. They are
+// assigned by `gazette serve`, and so are zero in every other process: client
+// dials in mainboilerplate are configured independently and statically, and
+// must not be made to track these (see clientFlowControlOptions there).
+//
+// Note the two are coupled: configuring EITHER one disables dynamic sizing for
+// streams as well as connections, falling back to a 64KB static default for
+// whichever is left unset. So "large connection window with a dynamically sized
+// stream window" cannot be expressed, and both should be set together.
+//
+// Static sizing is worth reaching for when connection-level credit is
+// oversubscribed: gRPC's dynamic sizing gives the connection the same window as
+// an individual stream, so a broker multiplexing MANY journals over one peer
+// connection can have a stream that holds stream-level credit yet still cannot
+// send, because other streams have filled the connection window. Setting
+// InitialConnWindowSize to math.MaxInt32 effectively disables connection-level
+// flow control and relies on stream-level flow control alone.
+//
+// InitialWindowSize then bounds worst-case buffering at
+// (concurrent streams * InitialWindowSize) per connection -- but it also caps
+// how much a client may have in flight on any one stream, so setting it too low
+// throttles bursty writers.
+var (
+	InitialConnWindowSize int32 = 0
+	InitialWindowSize     int32 = 0
+)
+
+// flowControlWindows resolves the configured connection and stream windows, or
+// (0, 0) to indicate that no options should be configured and gRPC's dynamic
+// sizing left in place.
+//
+// gRPC *ignores* a window below 64KB while still disabling dynamic sizing, so a
+// partially-configured pair would silently yield a 64KB window for whichever
+// side was left zero -- a 64KB connection window shared by every stream is far
+// worse than either intended setting. Configuring either window therefore
+// resolves the other to an explicit value rather than leaving it to that trap.
+func flowControlWindows() (conn, stream int32) {
+	if InitialConnWindowSize == 0 && InitialWindowSize == 0 {
+		return 0, 0
+	}
+	if conn, stream = InitialConnWindowSize, InitialWindowSize; conn == 0 {
+		conn = math.MaxInt32 // Effectively disable connection-level flow control.
+	}
+	if stream == 0 {
+		stream = 1 << 16 // gRPC's static default, stated explicitly.
+	}
+	return conn, stream
+}
+
+// flowControlServerOptions returns the window options to configure, which is
+// none at all when dynamic sizing is desired.
+func flowControlServerOptions() []grpc.ServerOption {
+	var conn, stream = flowControlWindows()
+	if conn == 0 && stream == 0 {
+		return nil
+	}
+	return []grpc.ServerOption{
+		grpc.InitialConnWindowSize(conn),
+		grpc.InitialWindowSize(stream),
+	}
+}
+
+// flowControlDialOptions returns the window options to configure for the
+// loopback ClientConn, which is none at all when dynamic sizing is desired.
+func flowControlDialOptions() []grpc.DialOption {
+	var conn, stream = flowControlWindows()
+	if conn == 0 && stream == 0 {
+		return nil
+	}
+	return []grpc.DialOption{
+		grpc.WithInitialConnWindowSize(conn),
+		grpc.WithInitialWindowSize(stream),
+	}
+}
 
 // Server bundles gRPC & HTTP servers, multiplexed over a single bound TCP
 // socket (using CMux). Additional protocols may be added to the Server by
@@ -102,11 +183,14 @@ func New(
 	var srv = &Server{
 		endpoint: pb.Endpoint(endpoint),
 		HTTPMux:  http.NewServeMux(),
-		GRPCServer: grpc.NewServer(
+		// The window a receiver advertises bounds what its senders may push, so
+		// flow control options here govern all inbound traffic -- notably
+		// Appends relayed to us by a peer acting as proxy.
+		GRPCServer: grpc.NewServer(append([]grpc.ServerOption{
 			grpc.StreamInterceptor(grpc_prometheus.StreamServerInterceptor),
 			grpc.UnaryInterceptor(grpc_prometheus.UnaryServerInterceptor),
 			grpc.MaxRecvMsgSize(int(maxGRPCRecvSize)),
-		),
+		}, flowControlServerOptions()...)...),
 	}
 
 	// gRPC v1.67+ requires that we advertise "h2" via ALPN.
@@ -154,15 +238,20 @@ func New(
 	var backoffConfig = backoff.DefaultConfig
 	backoffConfig.MaxDelay = time.Millisecond * 500
 
+	// This ClientConn is the origin of every broker-to-peer connection (its
+	// balancer dials peers directly), so flow control options here bound what we
+	// may push to a peer as well as what a peer may push to us.
 	srv.GRPCLoopback, err = grpc.DialContext(
 		context.Background(),
 		srv.endpoint.GRPCAddr(),
-		grpc.WithTransportCredentials(pb.NewDispatchedCredentials(peerTLS, srv.endpoint)),
-		grpc.WithConnectParams(grpc.ConnectParams{Backoff: backoffConfig}),
-		grpc.WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingConfig": [{"%s":{}}]}`, pb.DispatcherGRPCBalancerName)),
-		// Instrument client for gRPC metric collection.
-		grpc.WithUnaryInterceptor(grpc_prometheus.UnaryClientInterceptor),
-		grpc.WithStreamInterceptor(grpc_prometheus.StreamClientInterceptor),
+		append([]grpc.DialOption{
+			grpc.WithTransportCredentials(pb.NewDispatchedCredentials(peerTLS, srv.endpoint)),
+			grpc.WithConnectParams(grpc.ConnectParams{Backoff: backoffConfig}),
+			grpc.WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingConfig": [{"%s":{}}]}`, pb.DispatcherGRPCBalancerName)),
+			// Instrument client for gRPC metric collection.
+			grpc.WithUnaryInterceptor(grpc_prometheus.UnaryClientInterceptor),
+			grpc.WithStreamInterceptor(grpc_prometheus.StreamClientInterceptor),
+		}, flowControlDialOptions()...)...,
 	)
 
 	if err != nil {
