@@ -263,6 +263,18 @@ func (ks *KeySpace) Update() <-chan struct{} {
 // or until the context is done. A read lock of the KeySpace Mutex must be
 // held at invocation, and will be re-acquired before WaitForRevision returns.
 func (ks *KeySpace) WaitForRevision(ctx context.Context, revision int64) error {
+	return ks.WaitForRevisionOrWake(ctx, revision, nil)
+}
+
+// WaitForRevisionOrWake is WaitForRevision which additionally returns when
+// |wake| becomes ready, whether or not |revision| was reached. A nil |wake|
+// never is, making this exactly WaitForRevision.
+//
+// It exists because a KeySpace supplies no revision of its own accord: a
+// caller which must resume at a wall-clock deadline -- such as the allocator
+// pacing an operation it deliberately withheld -- would otherwise wait
+// indefinitely on a KeySpace which nothing else is writing to.
+func (ks *KeySpace) WaitForRevisionOrWake(ctx context.Context, revision int64, wake <-chan time.Time) error {
 	for {
 		if err := ctx.Err(); err != nil || ks.Header.Revision >= revision {
 			// Return current context error even if we also saw the revision,
@@ -273,13 +285,23 @@ func (ks *KeySpace) WaitForRevision(ctx context.Context, revision int64) error {
 		}
 
 		var ch = ks.updateCh
+		var woke bool
 
 		ks.Mu.RUnlock()
 		select {
 		case <-ch:
+		case <-wake:
+			woke = true
 		case <-ctx.Done():
 		}
 		ks.Mu.RLock()
+
+		// Return on |wake| rather than looping. A timer channel fires just
+		// once, so a further pass would silently wait on a drained channel and
+		// swallow the wake-up we were asked to deliver.
+		if woke {
+			return ctx.Err()
+		}
 	}
 }
 

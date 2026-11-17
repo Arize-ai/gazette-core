@@ -37,11 +37,24 @@ Broker:
                                                       (default: 9) [$BROKER_MAX_REPLICATION]
       --broker.min-append-rate=                       Min rate (in bytes-per-sec) at which a client may stream Append RPC content. RPCs unable to
                                                       sustain this rate are aborted (default: 65536) [$BROKER_MIN_APPEND_RATE]
+      --broker.min-append-rate-grace=                 Window over which an Append RPC client may deliver no data before it's aborted for failing
+                                                      min-append-rate. Raise it to tolerate bursty writers which hold an append open between
+                                                      bursts (default: 1s) [$BROKER_MIN_APPEND_RATE_GRACE]
+      --broker.initial-window-size=                   HTTP/2 stream flow control window, in bytes. Zero (with initial-conn-window-size also zero)
+                                                      uses gRPC's dynamic BDP window sizing (default: 0) [$BROKER_INITIAL_WINDOW_SIZE]
+      --broker.initial-conn-window-size=              HTTP/2 connection flow control window, in bytes. Zero (with initial-window-size also zero)
+                                                      uses gRPC's dynamic BDP window sizing (default: 0) [$BROKER_INITIAL_CONN_WINDOW_SIZE]
       --broker.watch-delay=                           Delay applied to the application of watched Etcd events. Larger values amortize the
                                                       processing of fast-changing Etcd keys. (default: 30ms) [$BROKER_WATCH_DELAY]
       --broker.auth-keys=                             Whitespace or comma separated, base64-encoded keys used to sign (first key) and verify (all
                                                       keys) Authorization tokens. [$BROKER_AUTH_KEYS]
       --broker.auto-suspend                           Automatically suspend journals which have persisted all fragments [$BROKER_AUTO_SUSPEND]
+      --broker.balance-primaries=                     Maximum primary journal assignments handed off per allocation round, to balance primaries
+                                                      across brokers within a journal's app.gazette.dev/balance-group label. If zero, primary
+                                                      balancing is disabled (default: 0) [$BROKER_BALANCE_PRIMARIES]
+      --broker.balance-primary-interval=              Minimum time between allocation rounds which hand off a primary journal assignment.
+                                                      Allocation rounds are driven by Etcd writes rather than a timer, so this paces the
+                                                      correction of accumulated imbalance (default: 10s) [$BROKER_BALANCE_PRIMARY_INTERVAL]
 
 Etcd:
       --etcd.address=                                 Etcd service address endpoint (default: http://localhost:2379) [$ETCD_ADDRESS]

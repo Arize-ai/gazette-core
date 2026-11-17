@@ -52,11 +52,25 @@ const (
 	// AWS, Azure, or GCP regions like "us-central1", "us-east-1", etc. Only one
 	// Region label is allowed. Compare to failure-domain.beta.kubernetes.io/region.
 	Region = "app.gazette.dev/region"
+
+	// BalanceGroup names a set of specifications which the allocator balances
+	// against one another, in addition to balancing the total load of each
+	// member. The partitions of a topic are the motivating case: a maximum
+	// assignment can place every partition's primary onto one member while
+	// still balancing that member's total assignment count perfectly.
+	//
+	// The value is opaque and matched exactly, so specifications under
+	// unrelated prefixes which share a value are one group. Prefer qualified
+	// values (eg "tracing/spans" rather than "spans") unless grouping across
+	// prefixes is intended. Only one BalanceGroup label is allowed, and an
+	// absent or empty value means the specification is ungrouped.
+	BalanceGroup = "app.gazette.dev/balance-group"
 )
 
 // SingleValueLabels identifies label names which must only have one label value
 // within a specification.
 var SingleValueLabels = map[string]struct{}{
+	BalanceGroup:   {},
 	ContentType:    {},
 	Instance:       {},
 	ManagedBy:      {},
