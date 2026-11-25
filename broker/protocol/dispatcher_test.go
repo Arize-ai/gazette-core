@@ -154,12 +154,17 @@ func (s *DispatcherSuite) TestDispatchCases(c *gc.C) {
 	c.Check(result.Done, gc.NotNil)
 	c.Check(result.SubConn.(*testSubConnWrapper).name, gc.Equals, "local.addr:80")
 
-	// Closure callback with an Unavailable error (only) will trigger an invalidation.
+	// Closure callback with an Unavailable or Unimplemented error (only) will trigger an invalidation.
 	result.Done(balancer.DoneInfo{Err: nil})
 	c.Check(mr.invalidated, gc.Equals, "")
 	result.Done(balancer.DoneInfo{Err: fmt.Errorf("other error")})
 	c.Check(mr.invalidated, gc.Equals, "")
+	result.Done(balancer.DoneInfo{Err: status.Error(codes.Internal, "foo")})
+	c.Check(mr.invalidated, gc.Equals, "")
 	result.Done(balancer.DoneInfo{Err: status.Error(codes.Unavailable, "foo")})
+	c.Check(mr.invalidated, gc.Equals, "item/two")
+	mr.invalidated = ""
+	result.Done(balancer.DoneInfo{Err: status.Error(codes.Unimplemented, "foo")})
 	c.Check(mr.invalidated, gc.Equals, "item/two")
 }
 
