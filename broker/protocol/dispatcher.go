@@ -363,7 +363,10 @@ func makeDoneClosure(dr dispatchRoute) func(balancer.DoneInfo) {
 	return func(info balancer.DoneInfo) {
 		if info.Err == nil {
 			return
-		} else if s, ok := status.FromError(info.Err); ok && s.Code() == codes.Unavailable {
+		} else if s, ok := status.FromError(info.Err); ok &&
+			// Every broker serves the Journal API, so Unimplemented means the route's
+			// endpoint now belongs to some other process (eg, a reused pod IP).
+			(s.Code() == codes.Unavailable || s.Code() == codes.Unimplemented) {
 			dr.DispatchRouter.UpdateRoute(dr.item, nil) // Invalidate.
 		}
 	}
